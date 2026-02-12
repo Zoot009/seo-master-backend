@@ -49,12 +49,20 @@ export async function analyzeSEO(url) {
 
     // Get HTML content
     const html = await page.content();
+    
+    // Calculate rendering percentage (text content vs HTML size)
+    const $ = cheerio.load(html);
+    const textContent = $("body").text().replace(/\s+/g, " ").trim();
+    const htmlSize = html.length;
+    const textSize = textContent.length;
+    const renderingPercentage = htmlSize > 0 
+      ? Math.round((textSize / htmlSize) * 100)
+      : 0;
 
     // Close browser
     await browser.close();
 
-    // Parse with Cheerio
-    const $ = cheerio.load(html);
+    // Parse with Cheerio (already loaded above)
 
     // Analyze Meta Tags
     const title = $("title").text() || "";
@@ -173,29 +181,71 @@ export async function analyzeSEO(url) {
     let identityType = "";
     let hasLocalBusinessSchema = false;
 
+    // Helper function to extract schema types recursively
+    const extractSchemaTypes = (schema) => {
+      if (!schema) return;
+      
+      // Handle @graph array
+      if (schema["@graph"] && Array.isArray(schema["@graph"])) {
+        schema["@graph"].forEach(item => extractSchemaTypes(item));
+        return;
+      }
+      
+      // Handle single schema or array of schemas
+      if (schema["@type"]) {
+        const types = Array.isArray(schema["@type"]) ? schema["@type"] : [schema["@type"]];
+        
+        types.forEach(type => {
+          if (type && !schemaTypes.includes(type)) {
+            schemaTypes.push(type);
+            
+            // Check for identity schema
+            if (type === "Organization" || type === "Person" || 
+                type === "Corporation" || type === "LocalBusiness") {
+              hasIdentitySchema = true;
+              identityType = type;
+            }
+            
+            // Check for local business schema
+            if (type === "LocalBusiness" || type.includes("LocalBusiness") ||
+                type === "Restaurant" || type === "Store" || 
+                type === "MedicalBusiness" || type === "ProfessionalService") {
+              hasLocalBusinessSchema = true;
+            }
+          }
+        });
+      }
+      
+      // Check nested objects
+      Object.values(schema).forEach(value => {
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          extractSchemaTypes(value);
+        } else if (Array.isArray(value)) {
+          value.forEach(item => {
+            if (item && typeof item === 'object') {
+              extractSchemaTypes(item);
+            }
+          });
+        }
+      });
+    };
+
     ldJsonScripts.each((_, el) => {
       try {
         const jsonContent = $(el).html();
         if (jsonContent) {
           const schema = JSON.parse(jsonContent);
-          if (schema["@type"]) {
-            const type = Array.isArray(schema["@type"]) ? schema["@type"][0] : schema["@type"];
-            schemaTypes.push(type);
-            
-            if (type === "Organization" || type === "Person") {
-              hasIdentitySchema = true;
-              identityType = type;
-            }
-            
-            if (type === "LocalBusiness" || type.includes("LocalBusiness")) {
-              hasLocalBusinessSchema = true;
-            }
-          }
+          extractSchemaTypes(schema);
         }
-      } catch {
-        // Invalid JSON, skip
+      } catch (error) {
+        console.log('[ANALYZER] Invalid JSON-LD schema:', error.message);
       }
     });
+    
+    // Also check for microdata and RDFa
+    const hasMicrodata = $('[itemtype]').length > 0;
+    const hasRDFa = $('[vocab], [typeof]').length > 0;
+    const hasAnyStructuredData = schemaTypes.length > 0 || hasMicrodata || hasRDFa;
 
     const technicalSEO = {
       hasRobotsTxt,
@@ -205,10 +255,13 @@ export async function analyzeSEO(url) {
       hasSSL: isSSL,
       isResponsive: viewport.length > 0,
       hasAnalytics,
-      hasSchema: schemaTypes.length > 0,
+      hasSchema: hasAnyStructuredData,
       schemaTypes,
       hasIdentitySchema,
       identityType: hasIdentitySchema ? identityType : undefined,
+      renderingPercentage,
+      hasMicrodata,
+      hasRDFa,
     };
 
     // Analyze Social Media Links
@@ -482,7 +535,15 @@ export async function analyzeSEO(url) {
       recommendations.push({
         title: "Add Organization or Person Schema",
         category: "Technical SEO",
-        priority: "Low Priority",
+        priority: "Medium Priority",
+      });
+    }
+    
+    if (!technicalSEO.hasSchema) {
+      recommendations.push({
+        title: "Add Schema.org Structured Data",
+        category: "Technical SEO",
+        priority: "Medium Priority",
       });
     }
 
