@@ -114,7 +114,7 @@ app.use((err, req, res, next) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 SEO Analyzer Backend running on port ${PORT}`);
+  console.log(`SEO Analyzer Backend running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`CORS allowed origins: ${allowedOrigins.join(', ')}`);
 });
