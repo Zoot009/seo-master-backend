@@ -349,34 +349,115 @@ export async function analyzeSEO(url) {
       pageSize: Math.round(html.length / 1024),
     };
 
-    // Calculate Score
-    let score = 0;
+    // Calculate Score - Start from 100 and deduct for issues
+    let score = 100;
+    let deductions = [];
 
-    if (metaTags.hasTitle && metaTags.titleLength >= 10 && metaTags.titleLength <= 60) score += 10;
-    else if (metaTags.hasTitle) score += 5;
+    // Title Tag - High Impact (deduct up to 10 points)
+    if (!metaTags.hasTitle) {
+      score -= 10;
+      deductions.push("Missing Title Tag: -10");
+    } else if (metaTags.titleLength < 50 || metaTags.titleLength > 60) {
+      score -= 5;
+      deductions.push("Suboptimal Title Length: -5");
+    }
     
-    if (metaTags.hasDescription && metaTags.descriptionLength >= 50 && metaTags.descriptionLength <= 160) score += 10;
-    else if (metaTags.hasDescription) score += 5;
+    // Meta Description - High Impact (deduct up to 10 points)
+    if (!metaTags.hasDescription) {
+      score -= 10;
+      deductions.push("Missing Meta Description: -10");
+    } else if (metaTags.descriptionLength < 120 || metaTags.descriptionLength > 160) {
+      score -= 5;
+      deductions.push("Suboptimal Description Length: -5");
+    }
     
-    if (metaTags.hasViewport) score += 5;
-    if (metaTags.hasOgTags) score += 3;
-    if (metaTags.hasTwitterCard) score += 2;
-
-    if (headings.hasH1 && headings.h1Count === 1) score += 10;
-    else if (headings.hasH1) score += 5;
-    if (headings.h2Count > 0) score += 5;
-
-    score += Math.round((imagesData.altPercentage / 100) * 15);
-
-    if (content.wordCount >= 300) score += 20;
-    else if (content.wordCount >= 150) score += 10;
-    else if (content.wordCount >= 50) score += 5;
-
-    if (linksData.total > 0) score += 5;
-    if (linksData.internal > 0) score += 5;
-
-    if (technicalSEO.hasSSL) score += 5;
-    if (technicalSEO.isResponsive) score += 5;
+    // H1 Tag - High Impact (deduct up to 10 points)
+    if (!headings.hasH1) {
+      score -= 10;
+      deductions.push("Missing H1 Tag: -10");
+    } else if (headings.h1Count !== 1) {
+      score -= 5;
+      deductions.push("Multiple H1 Tags: -5");
+    }
+    
+    // H2-H6 Headers - Medium Impact
+    if (headings.h2Count === 0) {
+      score -= 5;
+      deductions.push("No H2 Tags: -5");
+    }
+    
+    // Image Alt Attributes - Medium Impact (deduct based on percentage missing)
+    const altDeduction = Math.round((100 - imagesData.altPercentage) / 10);
+    if (altDeduction > 0) {
+      score -= altDeduction;
+      deductions.push(`Images without Alt (${100 - imagesData.altPercentage}%): -${altDeduction}`);
+    }
+    
+    // Content - High Impact
+    if (content.wordCount < 50) {
+      score -= 15;
+      deductions.push("Very Low Word Count: -15");
+    } else if (content.wordCount < 150) {
+      score -= 10;
+      deductions.push("Low Word Count: -10");
+    } else if (content.wordCount < 300) {
+      score -= 5;
+      deductions.push("Below Recommended Word Count: -5");
+    }
+    
+    // Technical SEO - Medium to High Impact
+    if (!technicalSEO.hasSSL) {
+      score -= 10;
+      deductions.push("No SSL Certificate: -10");
+    }
+    if (!technicalSEO.hasRobotsTxt) {
+      score -= 5;
+      deductions.push("No robots.txt: -5");
+    }
+    if (!technicalSEO.hasSitemap) {
+      score -= 5;
+      deductions.push("No XML Sitemap: -5");
+    }
+    if (!technicalSEO.hasSchema) {
+      score -= 5;
+      deductions.push("No Schema.org Data: -5");
+    }
+    if (!technicalSEO.hasIdentitySchema) {
+      score -= 3;
+      deductions.push("No Identity Schema: -3");
+    }
+    if (!technicalSEO.hasAnalytics) {
+      score -= 3;
+      deductions.push("No Analytics Tool: -3");
+    }
+    
+    // Basic SEO Elements
+    if (!metaTags.hasViewport) {
+      score -= 3;
+      deductions.push("No Viewport Meta: -3");
+    }
+    if (!metaTags.hasOgTags) {
+      score -= 2;
+      deductions.push("No Open Graph Tags: -2");
+    }
+    if (!metaTags.hasTwitterCard) {
+      score -= 2;
+      deductions.push("No Twitter Card: -2");
+    }
+    
+    // Links
+    if (linksData.total === 0) {
+      score -= 3;
+      deductions.push("No Links Found: -3");
+    } else if (linksData.internal === 0) {
+      score -= 2;
+      deductions.push("No Internal Links: -2");
+    }
+    
+    // Ensure score doesn't go below 0
+    score = Math.max(0, score);
+    
+    console.log(`[ANALYZER] Score calculations:`, deductions);
 
     // Determine Grade
     let grade = "F";
@@ -393,30 +474,50 @@ export async function analyzeSEO(url) {
     else if (score >= 40) grade = "D";
     else if (score >= 35) grade = "D-";
 
-    // Calculate On-Page SEO Score
-    let onPageScore = 0;
+    // Calculate On-Page SEO Score - Start from 100 and deduct for issues
+    let onPageScore = 100;
     
-    if (metaTags.hasTitle && metaTags.titleLength >= 50 && metaTags.titleLength <= 60) onPageScore += 20;
-    else if (metaTags.hasTitle && metaTags.titleLength >= 10 && metaTags.titleLength <= 70) onPageScore += 15;
-    else if (metaTags.hasTitle) onPageScore += 10;
+    // Title Tag - deduct up to 20 points
+    if (!metaTags.hasTitle) {
+      onPageScore -= 20;
+    } else if (metaTags.titleLength < 50 || metaTags.titleLength > 60) {
+      onPageScore -= 10;
+    }
     
-    if (metaTags.hasDescription && metaTags.descriptionLength >= 120 && metaTags.descriptionLength <= 160) onPageScore += 20;
-    else if (metaTags.hasDescription && metaTags.descriptionLength >= 50) onPageScore += 15;
+    // Meta Description - deduct up to 20 points
+    if (!metaTags.hasDescription) {
+      onPageScore -= 20;
+    } else if (metaTags.descriptionLength < 120 || metaTags.descriptionLength > 160) {
+      onPageScore -= 10;
+    }
     
-    if (headings.hasH1 && headings.h1Count === 1) onPageScore += 10;
-    else if (headings.hasH1) onPageScore += 5;
-    if (headings.h2Count >= 2) onPageScore += 10;
-    else if (headings.h2Count > 0) onPageScore += 5;
+    // H1 Tag - deduct up to 10 points
+    if (!headings.hasH1) {
+      onPageScore -= 10;
+    } else if (headings.h1Count !== 1) {
+      onPageScore -= 5;
+    }
     
-    if (imagesData.altPercentage === 100) onPageScore += 10;
-    else if (imagesData.altPercentage >= 80) onPageScore += 7;
-    else if (imagesData.altPercentage >= 50) onPageScore += 4;
+    // H2+ Tags - deduct up to 10 points
+    if (headings.h2Count === 0) {
+      onPageScore -= 10;
+    } else if (headings.h2Count === 1) {
+      onPageScore -= 5;
+    }
     
-    if (technicalSEO.hasSSL) onPageScore += 10;
-    if (technicalSEO.hasRobotsTxt) onPageScore += 5;
-    if (technicalSEO.hasSitemap) onPageScore += 5;
-    if (technicalSEO.hasSchema) onPageScore += 5;
-    if (technicalSEO.hasIdentitySchema) onPageScore += 5;
+    // Image Alt - deduct based on percentage missing (up to 10 points)
+    const onPageAltDeduction = Math.round((100 - imagesData.altPercentage) / 10);
+    onPageScore -= onPageAltDeduction;
+    
+    // Technical SEO elements
+    if (!technicalSEO.hasSSL) onPageScore -= 10;
+    if (!technicalSEO.hasRobotsTxt) onPageScore -= 5;
+    if (!technicalSEO.hasSitemap) onPageScore -= 5;
+    if (!technicalSEO.hasSchema) onPageScore -= 5;
+    if (!technicalSEO.hasIdentitySchema) onPageScore -= 5;
+    
+    // Ensure score doesn't go below 0
+    onPageScore = Math.max(0, onPageScore);
 
     let onPageMessage = "";
     let onPageDescription = "";
