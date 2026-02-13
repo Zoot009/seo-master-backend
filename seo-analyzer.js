@@ -354,6 +354,47 @@ export async function analyzeSEO(url) {
       youTubeUrl: hasYouTube ? youTubeUrl : undefined,
     };
 
+    // Analyze Local SEO - Phone and Address Detection
+    // Phone number regex patterns for various formats
+    const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|\d{3}[-.\s]\d{3}[-.\s]\d{4}|\+\d{1,3}\s?\d{1,14}/g;
+    const phoneMatches = bodyText.match(phoneRegex);
+    const hasPhone = phoneMatches && phoneMatches.length > 0;
+    const phoneNumber = hasPhone ? phoneMatches[0].trim() : undefined;
+
+    // Address detection - look for common address patterns and keywords
+    const addressKeywords = ['address', 'location', 'office', 'street', 'ave', 'avenue', 'road', 'rd', 'blvd', 'boulevard', 'suite', 'floor', 'building'];
+    const addressRegex = /\d+\s+[A-Za-z0-9\s,.-]+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|circle|way|place|plaza|square|trail|parkway|commons|suite|floor|building)[A-Za-z0-9\s,.-]*/gi;
+    
+    let hasAddress = false;
+    let addressText = undefined;
+    
+    // Check for address patterns
+    const addressMatches = bodyText.match(addressRegex);
+    if (addressMatches && addressMatches.length > 0) {
+      hasAddress = true;
+      addressText = addressMatches[0].trim();
+    } else {
+      // Alternative: check if address-related keywords exist with nearby text
+      const lowerBodyText = bodyText.toLowerCase();
+      for (const keyword of addressKeywords) {
+        const keywordIndex = lowerBodyText.indexOf(keyword);
+        if (keywordIndex !== -1) {
+          // Extract surrounding text (up to 200 characters after keyword)
+          const extractStart = keywordIndex;
+          const extractEnd = Math.min(keywordIndex + 200, bodyText.length);
+          const extractedText = bodyText.substring(extractStart, extractEnd).trim();
+          
+          // Check if it contains numbers (likely an address)
+          if (/\d/.test(extractedText)) {
+            hasAddress = true;
+            // Get first 100 chars or until double space/newline
+            addressText = extractedText.split(/\s{2,}|\n/)[0].substring(0, 100).trim();
+            break;
+          }
+        }
+      }
+    }
+
     // Performance
     const performance = {
       loadTime: loadTime,
@@ -558,6 +599,10 @@ export async function analyzeSEO(url) {
 
     const localSEO = {
       hasLocalBusinessSchema,
+      hasPhone,
+      phoneNumber,
+      hasAddress,
+      addressText,
     };
 
     // Generate Recommendations
@@ -590,8 +635,24 @@ export async function analyzeSEO(url) {
     if (!localSEO.hasLocalBusinessSchema) {
       recommendations.push({
         title: "Add Local Business Schema",
-        category: "Other",
+        category: "Local SEO",
         priority: "Low Priority",
+      });
+    }
+
+    if (!localSEO.hasPhone) {
+      recommendations.push({
+        title: "Add Phone Number to Website",
+        category: "Local SEO",
+        priority: "Medium Priority",
+      });
+    }
+
+    if (!localSEO.hasAddress) {
+      recommendations.push({
+        title: "Add Address Information to Website",
+        category: "Local SEO",
+        priority: "Medium Priority",
       });
     }
 
