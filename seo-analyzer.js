@@ -356,12 +356,25 @@ export async function analyzeSEO(url) {
 
     // Analyze Local SEO - Phone and Address Detection
     // Phone number regex patterns for various formats
-    const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|\d{3}[-.\s]\d{3}[-.\s]\d{4}|\+\d{1,3}\s?\d{1,14}/g;
+    const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
     const phoneMatches = bodyText.match(phoneRegex);
-    const hasPhone = phoneMatches && phoneMatches.length > 0;
-    const phoneNumber = hasPhone ? phoneMatches[0].trim() : undefined;
+    
+    // Validate phone numbers - filter out false positives
+    let validPhone = null;
+    if (phoneMatches) {
+      for (const match of phoneMatches) {
+        // Check if it's a reasonable phone format
+        const digitsOnly = match.replace(/\D/g, '');
+        if (digitsOnly.length >= 10 && digitsOnly.length <= 11) {
+          validPhone = match.trim();
+          break;
+        }
+      }
+    }
+    const hasPhone = validPhone !== null;
+    const phoneNumber = validPhone;
 
-    // Address detection - enhanced with better pattern matching
+    // Address detection - enhanced with better pattern matching and validation
     let hasAddress = false;
     let addressText = undefined;
     
@@ -374,7 +387,7 @@ export async function analyzeSEO(url) {
             const schema = JSON.parse(jsonContent);
             const extractAddress = (obj) => {
               if (obj.address) {
-                if (typeof obj.address === 'string') {
+                if (typeof obj.address === 'string' && obj.address.length > 15) {
                   return obj.address;
                 } else if (obj.address.streetAddress) {
                   const addr = obj.address;
@@ -400,7 +413,7 @@ export async function analyzeSEO(url) {
               addr = extractAddress(schema);
             }
             
-            if (addr && addr.length > 10) {
+            if (addr && addr.length > 15) {
               hasAddress = true;
               addressText = addr;
               return false; // break the each loop
@@ -414,20 +427,27 @@ export async function analyzeSEO(url) {
     
     // If no address in schema, try HTML pattern matching
     if (!hasAddress) {
-      // Look for addresses with street numbers and street types
-      const addressRegex = /\d+\s+[A-Za-z0-9\s]+\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Way|Place|Pl|Plaza|Square|Trail|Parkway|Pkwy)(?:[\s,]+[A-Za-z\s]+)?(?:[\s,]+[A-Z]{2})?\s*\d{5}?/gi;
+      // Look for addresses with street numbers (1-5 digits) and street types
+      const addressRegex = /\b\d{1,5}\s+[A-Za-z][A-Za-z\s.]+?\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Way|Place|Pl|Plaza|Square|Trail|Parkway|Pkwy)\b[,\s]*(?:[A-Za-z\s]+)?[,\s]*(?:[A-Z]{2})?\s*\d{5}?/gi;
       const addressMatches = bodyText.match(addressRegex);
       
+      // Blacklist words that indicate false positives
+      const blacklist = ['cart', 'product', 'search', 'return', 'shop', 'add', 'buy', 'order', 'checkout', 'total', 'price', 'sale'];
+      
       if (addressMatches && addressMatches.length > 0) {
-        // Find the most complete looking address (longest with zip code preferred)
-        let bestAddress = addressMatches[0];
+        // Find valid address (not containing blacklist words)
         for (const addr of addressMatches) {
-          if (addr.length > bestAddress.length && /\d{5}/.test(addr)) {
-            bestAddress = addr;
+          const lowerAddr = addr.toLowerCase();
+          const isValid = !blacklist.some(word => lowerAddr.includes(word)) && 
+                         addr.length > 15 && 
+                         addr.length < 200;
+          
+          if (isValid) {
+            hasAddress = true;
+            addressText = addr.trim();
+            break;
           }
         }
-        hasAddress = true;
-        addressText = bestAddress.trim().substring(0, 150);
       }
     }
 
