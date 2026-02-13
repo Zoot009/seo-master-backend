@@ -255,6 +255,7 @@ export async function analyzeSEO(url) {
     const hasMicrodata = $('[itemtype]').length > 0;
     const hasRDFa = $('[vocab], [typeof]').length > 0;
     const hasAnyStructuredData = schemaTypes.length > 0 || hasMicrodata || hasRDFa;
+    const hasJsonLd = ldJsonScripts.length > 0 && schemaTypes.length > 0;
 
     const technicalSEO = {
       hasRobotsTxt,
@@ -265,9 +266,11 @@ export async function analyzeSEO(url) {
       isResponsive: viewport.length > 0,
       hasAnalytics,
       hasSchema: hasAnyStructuredData,
+      hasJsonLd,
       schemaTypes,
       hasIdentitySchema,
       identityType: hasIdentitySchema ? identityType : undefined,
+      hasLocalBusinessSchema,
       renderingPercentage,
       hasMicrodata,
       hasRDFa,
