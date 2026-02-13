@@ -311,13 +311,15 @@ export async function analyzeSEO(url) {
     const hasLinkedIn = linkedInUrl.length > 0;
     const hasYouTube = youTubeUrl.length > 0;
 
-    // Calculate Social Score
+    // Calculate Social Score - Based on Facebook and Instagram only
     let socialScore = 0;
-    if (hasFacebookPage) socialScore += 20;
-    if (hasInstagram) socialScore += 20;
-    if (hasTwitter) socialScore += 20;
-    if (hasLinkedIn) socialScore += 20;
-    if (hasYouTube) socialScore += 20;
+    if (hasFacebookPage && hasInstagram) {
+      socialScore = 100;
+    } else if (hasFacebookPage || hasInstagram) {
+      socialScore = 50;
+    } else {
+      socialScore = 0;
+    }
 
     let socialMessage = "";
     let socialDescription = "";
@@ -325,12 +327,9 @@ export async function analyzeSEO(url) {
     if (socialScore === 0) {
       socialMessage = "Your social needs improvement";
       socialDescription = "You appear to have a weak social presence or level of social activity (or we may just not be able to see your profiles!). Social activity is important for customer communication, brand awareness and as a marketing channel to bring visitors to your website. We recommend that you list all of your profiles on your page for visibility, and begin to build a following on those networks.";
-    } else if (socialScore < 60) {
+    } else if (socialScore === 50) {
       socialMessage = "Your social presence needs work";
-      socialDescription = "You have some social media presence, but there's room for improvement. Social activity is important for customer communication, brand awareness and as a marketing channel to bring visitors to your website. Consider expanding to more platforms and making your profiles more visible.";
-    } else if (socialScore < 80) {
-      socialMessage = "Your social presence is good";
-      socialDescription = "You have a good social media presence with profiles on multiple platforms. Social activity is important for customer communication, brand awareness and as a marketing channel to bring visitors to your website. Keep building your following and engagement.";
+      socialDescription = "You have one major social media profile, but you're missing the other. Social activity is important for customer communication, brand awareness and as a marketing channel to bring visitors to your website. Consider adding both Facebook and Instagram profiles for better reach.";
     } else {
       socialMessage = "Your social presence is excellent!";
       socialDescription = "You have an excellent social media presence across multiple platforms. Social activity is important for customer communication, brand awareness and as a marketing channel to bring visitors to your website. Continue engaging with your audience across these networks.";
