@@ -41,8 +41,17 @@ export async function analyzeSEO(url) {
 
     const loadTime = Date.now() - startTime;
 
-    // Take screenshot
-    const screenshot = await page.screenshot({
+    // Take desktop screenshot
+    console.log(`[ANALYZER] Taking desktop screenshot...`);
+    const screenshotDesktop = await page.screenshot({
+      encoding: "base64",
+      fullPage: false,
+    });
+
+    // Take mobile screenshot
+    console.log(`[ANALYZER] Taking mobile screenshot...`);
+    await page.setViewport({ width: 375, height: 667 }); // iPhone SE size
+    const screenshotMobile = await page.screenshot({
       encoding: "base64",
       fullPage: false,
     });
@@ -655,7 +664,8 @@ export async function analyzeSEO(url) {
       url,
       score,
       grade,
-      screenshot: `data:image/png;base64,${screenshot}`,
+      screenshot: `data:image/png;base64,${screenshotDesktop}`,
+      screenshotMobile: `data:image/png;base64,${screenshotMobile}`,
       title,
       description,
       metaTags,
