@@ -50,7 +50,7 @@ export async function analyzeSEO(url) {
 
     // Take mobile screenshot
     console.log(`[ANALYZER] Taking mobile screenshot...`);
-    await page.setViewport({ width: 375, height: 667 }); // iPhone SE size
+    await page.setViewport({ width: 360, height: 640 }); // Compact mobile size
     const screenshotMobile = await page.screenshot({
       encoding: "base64",
       fullPage: false,
