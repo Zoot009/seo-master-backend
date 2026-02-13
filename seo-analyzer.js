@@ -110,7 +110,16 @@ export async function analyzeSEO(url) {
 
     // Analyze Images
     const images = $("img");
-    const imagesWithAlt = images.filter('[alt!=""]').length;
+    let imagesWithAlt = 0;
+    
+    // Count images with meaningful alt attributes (not empty or whitespace-only)
+    images.each((i, img) => {
+      const alt = $(img).attr("alt");
+      if (alt && alt.trim().length > 0) {
+        imagesWithAlt++;
+      }
+    });
+    
     const totalImages = images.length;
 
     const imagesData = {
