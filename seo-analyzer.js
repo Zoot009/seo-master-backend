@@ -730,7 +730,7 @@ export async function analyzeSEO(url) {
 
     if (!metaTags.hasDescription || metaTags.descriptionLength < 120 || metaTags.descriptionLength > 160) {
       recommendations.push({
-        title: "Optimize Meta Description (120-160 characters)",
+        title: "Optimize Meta Description",
         category: "On-Page SEO",
         priority: "High Priority",
       });
@@ -738,7 +738,7 @@ export async function analyzeSEO(url) {
 
     if (!metaTags.hasTitle || metaTags.titleLength < 50 || metaTags.titleLength > 60) {
       recommendations.push({
-        title: "Optimize Title Tag (50-60 characters)",
+        title: "Optimize Title Tag",
         category: "On-Page SEO",
         priority: "High Priority",
       });
