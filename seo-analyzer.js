@@ -361,37 +361,73 @@ export async function analyzeSEO(url) {
     const hasPhone = phoneMatches && phoneMatches.length > 0;
     const phoneNumber = hasPhone ? phoneMatches[0].trim() : undefined;
 
-    // Address detection - look for common address patterns and keywords
-    const addressKeywords = ['address', 'location', 'office', 'street', 'ave', 'avenue', 'road', 'rd', 'blvd', 'boulevard', 'suite', 'floor', 'building'];
-    const addressRegex = /\d+\s+[A-Za-z0-9\s,.-]+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|circle|way|place|plaza|square|trail|parkway|commons|suite|floor|building)[A-Za-z0-9\s,.-]*/gi;
-    
+    // Address detection - enhanced with better pattern matching
     let hasAddress = false;
     let addressText = undefined;
     
-    // Check for address patterns
-    const addressMatches = bodyText.match(addressRegex);
-    if (addressMatches && addressMatches.length > 0) {
-      hasAddress = true;
-      addressText = addressMatches[0].trim();
-    } else {
-      // Alternative: check if address-related keywords exist with nearby text
-      const lowerBodyText = bodyText.toLowerCase();
-      for (const keyword of addressKeywords) {
-        const keywordIndex = lowerBodyText.indexOf(keyword);
-        if (keywordIndex !== -1) {
-          // Extract surrounding text (up to 200 characters after keyword)
-          const extractStart = keywordIndex;
-          const extractEnd = Math.min(keywordIndex + 200, bodyText.length);
-          const extractedText = bodyText.substring(extractStart, extractEnd).trim();
-          
-          // Check if it contains numbers (likely an address)
-          if (/\d/.test(extractedText)) {
-            hasAddress = true;
-            // Get first 100 chars or until double space/newline
-            addressText = extractedText.split(/\s{2,}|\n/)[0].substring(0, 100).trim();
-            break;
+    // First, try to extract from Schema.org structured data
+    if (ldJsonScripts.length > 0) {
+      ldJsonScripts.each((_, el) => {
+        try {
+          const jsonContent = $(el).html();
+          if (jsonContent) {
+            const schema = JSON.parse(jsonContent);
+            const extractAddress = (obj) => {
+              if (obj.address) {
+                if (typeof obj.address === 'string') {
+                  return obj.address;
+                } else if (obj.address.streetAddress) {
+                  const addr = obj.address;
+                  const parts = [
+                    addr.streetAddress,
+                    addr.addressLocality,
+                    addr.addressRegion,
+                    addr.postalCode
+                  ].filter(Boolean);
+                  return parts.join(', ');
+                }
+              }
+              return null;
+            };
+            
+            let addr = null;
+            if (schema['@graph']) {
+              for (const item of schema['@graph']) {
+                addr = extractAddress(item);
+                if (addr) break;
+              }
+            } else {
+              addr = extractAddress(schema);
+            }
+            
+            if (addr && addr.length > 10) {
+              hasAddress = true;
+              addressText = addr;
+              return false; // break the each loop
+            }
+          }
+        } catch (e) {
+          // Skip invalid JSON
+        }
+      });
+    }
+    
+    // If no address in schema, try HTML pattern matching
+    if (!hasAddress) {
+      // Look for addresses with street numbers and street types
+      const addressRegex = /\d+\s+[A-Za-z0-9\s]+\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Way|Place|Pl|Plaza|Square|Trail|Parkway|Pkwy)(?:[\s,]+[A-Za-z\s]+)?(?:[\s,]+[A-Z]{2})?\s*\d{5}?/gi;
+      const addressMatches = bodyText.match(addressRegex);
+      
+      if (addressMatches && addressMatches.length > 0) {
+        // Find the most complete looking address (longest with zip code preferred)
+        let bestAddress = addressMatches[0];
+        for (const addr of addressMatches) {
+          if (addr.length > bestAddress.length && /\d{5}/.test(addr)) {
+            bestAddress = addr;
           }
         }
+        hasAddress = true;
+        addressText = bestAddress.trim().substring(0, 150);
       }
     }
 
