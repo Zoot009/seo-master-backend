@@ -111,12 +111,30 @@ export async function analyzeSEO(url) {
     // Analyze Images
     const images = $("img");
     let imagesWithAlt = 0;
+    const imagesList = [];
+    const imagesWithAltList = [];
+    const imagesWithoutAltList = [];
     
     // Count images with meaningful alt attributes (not empty or whitespace-only)
     images.each((i, img) => {
-      const alt = $(img).attr("alt");
-      if (alt && alt.trim().length > 0) {
+      const $img = $(img);
+      const src = $img.attr("src") || '';
+      const alt = $img.attr("alt");
+      const hasAlt = alt !== undefined && alt !== null && alt.trim().length > 0;
+      
+      const imageData = {
+        src: src,
+        alt: alt || '',
+        hasAlt: hasAlt
+      };
+      
+      imagesList.push(imageData);
+      
+      if (hasAlt) {
         imagesWithAlt++;
+        imagesWithAltList.push(imageData);
+      } else {
+        imagesWithoutAltList.push(imageData);
       }
     });
     
@@ -128,6 +146,9 @@ export async function analyzeSEO(url) {
       withoutAlt: totalImages - imagesWithAlt,
       altPercentage:
         totalImages > 0 ? Math.round((imagesWithAlt / totalImages) * 100) : 100,
+      all: imagesList,
+      withAltList: imagesWithAltList,
+      withoutAltList: imagesWithoutAltList
     };
 
     // Analyze Links

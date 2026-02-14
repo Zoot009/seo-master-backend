@@ -20,7 +20,6 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { analyzeSEO } from './seo-analyzer.js';
-import { checkAltTags } from './alt-tag-checker.js';
 
 dotenv.config();
 
@@ -98,37 +97,6 @@ app.post('/api/analyze', authenticateApiKey, async (req, res) => {
       success: false,
       error: error.message || 'Failed to analyze website',
       reportId: req.body.reportId
-    });
-  }
-});
-
-// Alt Tag Checker endpoint (auth required)
-app.post('/api/check-alt-tags', authenticateApiKey, async (req, res) => {
-  try {
-    const { url } = req.body;
-
-    // Validate URL
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({ 
-        success: false,
-        error: 'URL is required and must be a string' 
-      });
-    }
-
-    console.log(`[BACKEND] Starting Alt Tag check for: ${url}`);
-
-    // Perform Alt Tag analysis
-    const result = await checkAltTags(url);
-
-    console.log(`[BACKEND] Alt Tag check completed for: ${url}`);
-
-    res.json(result);
-
-  } catch (error) {
-    console.error('[BACKEND] Alt Tag check error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to check alt tags'
     });
   }
 });
