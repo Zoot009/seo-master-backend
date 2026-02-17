@@ -5,26 +5,57 @@
  * Supports: JSON-LD, Microdata, and RDFa formats
  */
 
-import axios from 'axios';
+import puppeteer from 'puppeteer';
 import * as cheerio from 'cheerio';
 
 /**
  * Extract all schema markup from a webpage
  */
 export async function validateSchema(url) {
+  let browser;
   try {
+    console.log(`[SCHEMA] ========================================`);
     console.log(`[SCHEMA] Starting schema validation for: ${url}`);
+    console.log(`[SCHEMA] ========================================`);
 
-    // Fetch the webpage
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-      timeout: 15000,
-      maxRedirects: 5,
+    // Ensure URL has protocol
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      url = "https://" + url;
+      console.log(`[SCHEMA] Added protocol: ${url}`);
+    }
+
+    // Launch Puppeteer browser
+    console.log(`[SCHEMA] Launching Puppeteer browser...`);
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+      ],
     });
+    console.log(`[SCHEMA] Browser launched successfully`);
 
-    const html = response.data;
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1920, height: 1080 });
+
+    // Navigate to the page
+    console.log(`[SCHEMA] Navigating to page: ${url}`);
+    await page.goto(url, {
+      waitUntil: "networkidle2",
+      timeout: 30000,
+    });
+    console.log(`[SCHEMA] Page loaded successfully`);
+
+    // Get HTML content after JavaScript execution
+    const html = await page.content();
+    console.log(`[SCHEMA] Webpage content captured (${html.length} bytes)`);
+    
+    // Close browser
+    await browser.close();
+    console.log(`[SCHEMA] Browser closed`);
+
     const $ = cheerio.load(html);
 
     // Results object
@@ -77,13 +108,23 @@ export async function validateSchema(url) {
     results.summary.types = Array.from(allTypes);
     results.summary.hasSchema = results.summary.totalSchemas > 0;
 
-    console.log(`[SCHEMA] Found ${results.summary.totalSchemas} schemas on ${url}`);
-    console.log(`[SCHEMA] Types: ${results.summary.types.join(', ')}`);
+    console.log(`[SCHEMA] ========================================`);
+    console.log(`[SCHEMA] SUMMARY for ${url}`);
+    console.log(`[SCHEMA] Total schemas found: ${results.summary.totalSchemas}`);
+    console.log(`[SCHEMA] JSON-LD: ${jsonLdSchemas.length}`);
+    console.log(`[SCHEMA] Microdata: ${microdataSchemas.length}`);
+    console.log(`[SCHEMA] RDFa: ${rdfaSchemas.length}`);
+    console.log(`[SCHEMA] Schema types: ${results.summary.types.join(', ') || 'None'}`);
+    console.log(`[SCHEMA] ========================================`);
 
     return results;
 
   } catch (error) {
     console.error('[SCHEMA] Validation error:', error.message);
+    if (browser) {
+      console.log(`[SCHEMA] Closing browser after error...`);
+      await browser.close();
+    }
     throw new Error(`Failed to validate schema: ${error.message}`);
   }
 }
@@ -94,24 +135,41 @@ export async function validateSchema(url) {
 function extractJsonLd($) {
   const schemas = [];
   
-  $('script[type="application/ld+json"]').each((index, element) => {
+  console.log(`[SCHEMA] Looking for JSON-LD scripts...`);
+  const jsonLdScripts = $('script[type="application/ld+json"]');
+  console.log(`[SCHEMA] Found ${jsonLdScripts.length} JSON-LD script(s)`);
+  
+  jsonLdScripts.each((index, element) => {
     try {
       const content = $(element).html();
+      console.log(`[SCHEMA] JSON-LD #${index + 1} content length: ${content?.length || 0} chars`);
+      
+      if (!content || content.trim() === '') {
+        console.log(`[SCHEMA] JSON-LD #${index + 1} is empty, skipping`);
+        return;
+      }
+      
       const parsed = JSON.parse(content);
+      console.log(`[SCHEMA] JSON-LD #${index + 1} parsed successfully`);
+      console.log(`[SCHEMA] JSON-LD #${index + 1} type:`, parsed['@type'] || 'No @type');
       
       // Handle @graph arrays
       if (parsed['@graph']) {
+        console.log(`[SCHEMA] JSON-LD #${index + 1} contains @graph with ${parsed['@graph'].length} items`);
         schemas.push(...parsed['@graph']);
       } else if (Array.isArray(parsed)) {
+        console.log(`[SCHEMA] JSON-LD #${index + 1} is an array with ${parsed.length} items`);
         schemas.push(...parsed);
       } else {
+        console.log(`[SCHEMA] JSON-LD #${index + 1} is a single object`);
         schemas.push(parsed);
       }
     } catch (error) {
-      console.error('[SCHEMA] Error parsing JSON-LD:', error.message);
+      console.error(`[SCHEMA] Error parsing JSON-LD #${index + 1}:`, error.message);
     }
   });
 
+  console.log(`[SCHEMA] Total JSON-LD schemas extracted: ${schemas.length}`);
   return schemas;
 }
 

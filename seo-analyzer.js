@@ -74,7 +74,34 @@ export async function analyzeSEO(url) {
     // Parse with Cheerio (already loaded above)
 
     // Analyze Meta Tags
-    const title = $("title").text() || "";
+    let title = $("title").first().text().trim() || "";
+    
+    // Clean up title - remove payment method keywords that sometimes get injected
+    const paymentKeywords = [
+      'Apple Pay', 'ApplePay', 'Google Pay', 'GooglePay', 
+      'Klarna', 'Mastercard', 'MasterCard', 'Visa', 'PayPal',
+      'American Express', 'Amex', 'Discover', 'Diners Club'
+    ];
+    
+    // Remove payment keywords if they appear at the end of the title
+    paymentKeywords.forEach(keyword => {
+      const regex = new RegExp(`\\s*${keyword}\\s*$`, 'gi');
+      title = title.replace(regex, '').trim();
+    });
+    
+    // Remove multiple consecutive payment keywords concatenated together
+    const concatenatedPattern = new RegExp(
+      `\\s*[-|]?\\s*(${paymentKeywords.join('|')})\\s*`, 
+      'gi'
+    );
+    const cleaned = title.replace(concatenatedPattern, ' ').replace(/\s+/g, ' ').trim();
+    if (cleaned.length > 0 && cleaned.length < title.length * 0.8) {
+      // Only use cleaned version if it removed a significant amount (likely payment methods)
+      title = cleaned;
+    }
+    
+    console.log(`[ANALYZER] Title Tag: "${title}" (Length: ${title.length})`);
+    
     const description = $('meta[name="description"]').attr("content") || "";
     const viewport = $('meta[name="viewport"]').attr("content") || "";
     const ogTags = $('meta[property^="og:"]').length;
@@ -385,28 +412,50 @@ export async function analyzeSEO(url) {
     };
 
     // Analyze Local SEO - Phone and Address Detection
-    // Phone number regex patterns for various formats
-    const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
-    const phoneMatches = bodyText.match(phoneRegex);
+    // Enhanced phone number detection with multiple patterns
+    const phonePatterns = [
+      // US/Canada formats with country code
+      /\+1[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g,
+      // Standard US format variations
+      /\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g,
+      // International format
+      /\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}/g,
+      // Dot separated or space separated
+      /\d{3}[.\s]\d{3}[.\s]\d{4}/g,
+    ];
     
-    // Validate phone numbers - filter out false positives
-    let validPhone = null;
-    if (phoneMatches) {
-      for (const match of phoneMatches) {
-        // Check if it's a reasonable phone format
-        const digitsOnly = match.replace(/\D/g, '');
-        if (digitsOnly.length >= 10 && digitsOnly.length <= 11) {
-          validPhone = match.trim();
-          break;
-        }
+    let phoneMatches = [];
+    for (const pattern of phonePatterns) {
+      const matches = bodyText.matchAll(pattern);
+      for (const match of matches) {
+        phoneMatches.push({ source: 'bodyText', value: match[0] });
       }
     }
+    
+    // Also check for tel: links in HTML for better accuracy
+    const telLinks = $('a[href^="tel:"]');
+    telLinks.each((_, el) => {
+      const telHref = $(el).attr('href');
+      const displayText = $(el).text().trim();
+      if (displayText && /\d/.test(displayText)) {
+        phoneMatches.unshift({ source: 'tel:link', value: displayText });
+      }
+    });
+    
+    // Use the first phone number found (exact format)
+    let validPhone = null;
+    if (phoneMatches.length > 0) {
+      validPhone = phoneMatches[0].value;
+      console.log(`[ANALYZER] Phone: "${validPhone}"`);
+    }
+    
     const hasPhone = validPhone !== null;
     const phoneNumber = validPhone;
 
-    // Address detection - enhanced with better pattern matching and validation
+    // Address detection
     let hasAddress = false;
     let addressText = undefined;
+    let addressSource = undefined;
     
     // First, try to extract from Schema.org structured data
     if (ldJsonScripts.length > 0) {
@@ -446,6 +495,7 @@ export async function analyzeSEO(url) {
             if (addr && addr.length > 15) {
               hasAddress = true;
               addressText = addr;
+              addressSource = 'Schema.org';
               return false; // break the each loop
             }
           }
@@ -457,28 +507,59 @@ export async function analyzeSEO(url) {
     
     // If no address in schema, try HTML pattern matching
     if (!hasAddress) {
-      // Look for addresses with street numbers (1-5 digits) and street types
-      const addressRegex = /\b\d{1,5}\s+[A-Za-z][A-Za-z\s.]+?\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Way|Place|Pl|Plaza|Square|Trail|Parkway|Pkwy)\b[,\s]*(?:[A-Za-z\s]+)?[,\s]*(?:[A-Z]{2})?\s*\d{5}?/gi;
-      const addressMatches = bodyText.match(addressRegex);
+      let addressCandidates = [];
       
-      // Blacklist words that indicate false positives
-      const blacklist = ['cart', 'product', 'search', 'return', 'shop', 'add', 'buy', 'order', 'checkout', 'total', 'price', 'sale'];
-      
-      if (addressMatches && addressMatches.length > 0) {
-        // Find valid address (not containing blacklist words)
-        for (const addr of addressMatches) {
-          const lowerAddr = addr.toLowerCase();
-          const isValid = !blacklist.some(word => lowerAddr.includes(word)) && 
-                         addr.length > 15 && 
-                         addr.length < 200;
-          
-          if (isValid) {
-            hasAddress = true;
-            addressText = addr.trim();
-            break;
-          }
-        }
+      // Look for addresses with street numbers and street types (US format)
+      const usAddressRegex = /\b\d{1,5}\s+[A-Za-z][A-Za-z\s.]+?\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Way|Place|Pl|Plaza|Square|Trail|Parkway|Pkwy|Highway|Hwy)\b[,\s]*(?:[A-Za-z\s]+)?[,\s]*(?:[A-Z]{2})?\s*\d{5}?/gi;
+      const usMatches = bodyText.match(usAddressRegex);
+      if (usMatches) {
+        usMatches.forEach(m => addressCandidates.push({ text: m, source: 'US address pattern' }));
       }
+      
+      // Look for PO Box addresses
+      const poBoxRegex = /P\.?O\.?\s*Box\s+\d+[,\s]*[A-Za-z\s]*[,\s]*[A-Z]{2}\s*\d{5}/gi;
+      const poBoxMatches = bodyText.match(poBoxRegex);
+      if (poBoxMatches) {
+        poBoxMatches.forEach(m => addressCandidates.push({ text: m, source: 'PO Box pattern' }));
+      }
+      
+      // Check for address-related microdata or structured markup
+      $('[itemprop*="address"], [itemtype*="PostalAddress"]').each((_, el) => {
+        const addrText = $(el).text().trim().replace(/\s+/g, ' ');
+        if (addrText.length > 15 && addrText.length < 200) {
+          addressCandidates.push({ text: addrText, source: 'Microdata itemprop' });
+        }
+      });
+      
+      // Look for elements with address-related classes or IDs
+      const addressSelectors = [
+        '.address', '#address', '[class*="address"]',
+        '.location', '#location', '[class*="location"]',
+        '.contact-info', '.contact-address'
+      ];
+      
+      addressSelectors.forEach(selector => {
+        $(selector).each((_, el) => {
+          const addrText = $(el).text().trim().replace(/\s+/g, ' ');
+          if (addrText.length > 15 && addrText.length < 200 && /\d/.test(addrText)) {
+            addressCandidates.push({ text: addrText, source: `CSS selector: ${selector}` });
+          }
+        });
+      });
+      
+      // Use the first address found
+      if (addressCandidates.length > 0) {
+        hasAddress = true;
+        addressText = addressCandidates[0].text.trim();
+        addressSource = addressCandidates[0].source;
+      }
+    }
+    
+    // Always log the final address result
+    if (hasAddress && addressText) {
+      console.log(`[ANALYZER] Address: "${addressText}" (Source: ${addressSource})`);
+    } else {
+      console.log(`[ANALYZER] Address: Not found`);
     }
 
     // Performance
