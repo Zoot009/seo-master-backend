@@ -20,6 +20,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { analyzeSEO } from './seo-analyzer.js';
+import { validateSchema } from './schema-validator.js';
 
 dotenv.config();
 
@@ -97,6 +98,37 @@ app.post('/api/analyze', authenticateApiKey, async (req, res) => {
       success: false,
       error: error.message || 'Failed to analyze website',
       reportId: req.body.reportId
+    });
+  }
+});
+
+// Schema Markup Validation endpoint (auth required)
+app.post('/api/validate-schema', authenticateApiKey, async (req, res) => {
+  try {
+    const { url } = req.body;
+
+    // Validate URL
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'URL is required and must be a string' });
+    }
+
+    console.log(`[BACKEND] Starting schema validation for: ${url}`);
+
+    // Validate schema markup
+    const result = await validateSchema(url);
+
+    console.log(`[BACKEND] Schema validation completed for: ${url}`);
+
+    res.json({
+      success: true,
+      data: result
+    });
+
+  } catch (error) {
+    console.error('[BACKEND] Schema validation error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to validate schema markup'
     });
   }
 });
