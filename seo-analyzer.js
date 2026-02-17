@@ -792,7 +792,7 @@ export async function analyzeSEO(url) {
 
     if (!technicalSEO.hasIdentitySchema) {
       recommendations.push({
-        title: "Add Local Business Schema",
+        title: "Add Identity Schema",
         category: "Technical SEO",
         priority: "Medium Priority",
       });
