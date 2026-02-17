@@ -768,7 +768,7 @@ export async function analyzeSEO(url) {
 
     if (!metaTags.hasTitle || metaTags.titleLength < 50 || metaTags.titleLength > 60) {
       recommendations.push({
-        title: "Optimize Title Tag",
+        title: "Increase length of Title Tag",
         category: "On-Page SEO",
         priority: "High Priority",
       });
@@ -776,7 +776,7 @@ export async function analyzeSEO(url) {
 
     if (headings.h1Count !== 1) {
       recommendations.push({
-        title: "Use exactly one H1 tag per page",
+        title: "Add H1 Header Tag",
         category: "On-Page SEO",
         priority: "High Priority",
       });
@@ -784,7 +784,7 @@ export async function analyzeSEO(url) {
 
     if (imagesData.altPercentage < 100) {
       recommendations.push({
-        title: "Add alt text to all images",
+        title: "Add Alt Attributes to all images",
         category: "On-Page SEO",
         priority: "Medium Priority",
       });
@@ -792,7 +792,7 @@ export async function analyzeSEO(url) {
 
     if (!technicalSEO.hasIdentitySchema) {
       recommendations.push({
-        title: "Add Organization or Person Schema",
+        title: "Add Local Business Schema",
         category: "Technical SEO",
         priority: "Medium Priority",
       });
