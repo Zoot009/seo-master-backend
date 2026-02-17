@@ -39,6 +39,11 @@ export async function analyzeSEO(url) {
     });
     console.log(`[ANALYZER] Page loaded successfully`);
 
+    // Wait additional time for page to fully render (fonts, images, animations, etc.)
+    console.log(`[ANALYZER] Waiting for complete page rendering...`);
+    await page.waitForTimeout(3000); // Wait 3 seconds
+    console.log(`[ANALYZER] Page fully rendered`);
+
     const loadTime = Date.now() - startTime;
 
     // Take desktop screenshot
