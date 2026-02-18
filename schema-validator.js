@@ -44,7 +44,6 @@ export async function validateSchema(url) {
     console.log(`[SCHEMA] Navigating to page: ${url}`);
     await page.goto(url, {
       waitUntil: "networkidle2",
-      timeout: 30000,
     });
     console.log(`[SCHEMA] Page loaded successfully`);
 
