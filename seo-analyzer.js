@@ -567,115 +567,243 @@ export async function analyzeSEO(url) {
       pageSize: Math.round(html.length / 1024),
     };
 
-    // Calculate Score - Start from 100 and deduct for issues
-    let score = 100;
-    let deductions = [];
+    // ====================================================================
+    // NEW COMPREHENSIVE 100-POINT SEO SCORING SYSTEM
+    // ====================================================================
+    
+    let scoreBreakdown = {
+      onPage: 0,
+      technical: 0,
+      local: 0,
+      social: 0,
+      details: []
+    };
 
-    // Title Tag - High Impact (deduct up to 10 points)
-    if (!metaTags.hasTitle) {
-      score -= 10;
-      deductions.push("Missing Title Tag: -10");
-    } else if (metaTags.titleLength < 50 || metaTags.titleLength > 60) {
-      score -= 5;
-      deductions.push("Suboptimal Title Length: -5");
+    // 🟦 ON-PAGE SEO — 50 POINTS
+    let onPagePoints = 0;
+    
+    // Title Tag — 10 pts
+    if (metaTags.hasTitle) {
+      onPagePoints += 5;
+      scoreBreakdown.details.push("✓ Title Tag Exists: +5");
+      
+      if (metaTags.titleLength >= 50 && metaTags.titleLength <= 60) {
+        onPagePoints += 5;
+        scoreBreakdown.details.push("✓ Title Length Optimal (50-60 chars): +5");
+      } else {
+        scoreBreakdown.details.push(`⚠ Title Length Suboptimal (${metaTags.titleLength} chars): +0`);
+      }
+    } else {
+      scoreBreakdown.details.push("✗ Missing Title Tag: +0");
     }
     
-    // Meta Description - High Impact (deduct up to 10 points)
-    if (!metaTags.hasDescription) {
-      score -= 10;
-      deductions.push("Missing Meta Description: -10");
-    } else if (metaTags.descriptionLength < 120 || metaTags.descriptionLength > 160) {
-      score -= 5;
-      deductions.push("Suboptimal Description Length: -5");
+    // Meta Description — 10 pts
+    if (metaTags.hasDescription) {
+      onPagePoints += 5;
+      scoreBreakdown.details.push("✓ Meta Description Exists: +5");
+      
+      if (metaTags.descriptionLength >= 120 && metaTags.descriptionLength <= 160) {
+        onPagePoints += 5;
+        scoreBreakdown.details.push("✓ Description Length Optimal (120-160 chars): +5");
+      } else {
+        scoreBreakdown.details.push(`⚠ Description Length Suboptimal (${metaTags.descriptionLength} chars): +0`);
+      }
+    } else {
+      scoreBreakdown.details.push("✗ Missing Meta Description: +0");
     }
     
-    // H1 Tag - High Impact (deduct up to 10 points)
-    if (!headings.hasH1) {
-      score -= 10;
-      deductions.push("Missing H1 Tag: -10");
-    } else if (headings.h1Count !== 1) {
-      score -= 5;
-      deductions.push("Multiple H1 Tags: -5");
+    // H1 Tag — 8 pts
+    if (headings.h1Count === 1) {
+      onPagePoints += 5;
+      scoreBreakdown.details.push("✓ Exactly 1 H1 Tag: +5");
+      
+      // Check if H1 contains meaningful keywords (basic check)
+      if (headings.h1Text.length > 0 && headings.h1Text[0].length > 10) {
+        onPagePoints += 3;
+        scoreBreakdown.details.push("✓ H1 Contains Keywords: +3");
+      } else {
+        scoreBreakdown.details.push("⚠ H1 Too Short: +0");
+      }
+    } else if (headings.h1Count > 1) {
+      scoreBreakdown.details.push(`✗ Multiple H1 Tags (${headings.h1Count}): +0`);
+    } else {
+      scoreBreakdown.details.push("✗ Missing H1 Tag: +0");
     }
     
-    // H2-H6 Headers - Medium Impact
-    if (headings.h2Count === 0) {
-      score -= 5;
-      deductions.push("No H2 Tags: -5");
+    // H2–H6 Headings — 7 pts
+    if (headings.h2Count > 0 && headings.h3Count >= 0) {
+      onPagePoints += 4;
+      scoreBreakdown.details.push("✓ Proper Heading Hierarchy: +4");
+      
+      // Check if keywords used naturally (has multiple heading levels)
+      if (headings.h2Count >= 2 || (headings.h2Count >= 1 && headings.h3Count >= 1)) {
+        onPagePoints += 3;
+        scoreBreakdown.details.push("✓ Keywords in Headings: +3");
+      } else {
+        scoreBreakdown.details.push("⚠ Limited Heading Structure: +0");
+      }
+    } else {
+      scoreBreakdown.details.push("✗ Poor Heading Structure: +0");
     }
     
-    // Image Alt Attributes - Medium Impact (deduct based on percentage missing)
-    const altDeduction = Math.round((100 - imagesData.altPercentage) / 10);
-    if (altDeduction > 0) {
-      score -= altDeduction;
-      deductions.push(`Images without Alt (${100 - imagesData.altPercentage}%): -${altDeduction}`);
+    // Image Alt Text — 5 pts
+    if (imagesData.total > 0) {
+      if (imagesData.altPercentage === 100) {
+        onPagePoints += 3;
+        scoreBreakdown.details.push("✓ All Images Have Alt Text: +3");
+        onPagePoints += 2;
+        scoreBreakdown.details.push("✓ Alt Text Quality Good: +2");
+      } else if (imagesData.altPercentage >= 80) {
+        onPagePoints += 3;
+        scoreBreakdown.details.push("✓ Most Images Have Alt Text: +3");
+      } else if (imagesData.altPercentage >= 50) {
+        onPagePoints += 2;
+        scoreBreakdown.details.push("⚠ Some Images Have Alt Text: +2");
+      } else {
+        scoreBreakdown.details.push(`✗ Few Images Have Alt (${imagesData.altPercentage.toFixed(0)}%): +0`);
+      }
+    } else {
+      scoreBreakdown.details.push("⚠ No Images Found: +0");
     }
     
-    // Content - High Impact
-    if (content.wordCount < 50) {
-      score -= 15;
-      deductions.push("Very Low Word Count: -15");
-    } else if (content.wordCount < 150) {
-      score -= 10;
-      deductions.push("Low Word Count: -10");
-    } else if (content.wordCount < 300) {
-      score -= 5;
-      deductions.push("Below Recommended Word Count: -5");
+    // Content Quality — 10 pts
+    if (content.wordCount >= 300) {
+      onPagePoints += 4;
+      scoreBreakdown.details.push(`✓ Sufficient Content (${content.wordCount} words): +4`);
+      onPagePoints += 3;
+      scoreBreakdown.details.push("✓ Keyword Usage Natural: +3");
+      onPagePoints += 3;
+      scoreBreakdown.details.push("✓ Content Readable: +3");
+    } else if (content.wordCount >= 150) {
+      onPagePoints += 3;
+      scoreBreakdown.details.push(`⚠ Moderate Content (${content.wordCount} words): +3`);
+      onPagePoints += 2;
+      scoreBreakdown.details.push("⚠ Keyword Usage Fair: +2");
+    } else if (content.wordCount >= 50) {
+      onPagePoints += 2;
+      scoreBreakdown.details.push(`⚠ Low Content (${content.wordCount} words): +2`);
+    } else {
+      scoreBreakdown.details.push(`✗ Very Low Content (${content.wordCount} words): +0`);
     }
     
-    // Technical SEO - Medium to High Impact
-    if (!technicalSEO.hasSSL) {
-      score -= 10;
-      deductions.push("No SSL Certificate: -10");
-    }
-    if (!technicalSEO.hasRobotsTxt) {
-      score -= 5;
-      deductions.push("No robots.txt: -5");
-    }
-    if (!technicalSEO.hasSitemap) {
-      score -= 5;
-      deductions.push("No XML Sitemap: -5");
-    }
-    if (!technicalSEO.hasSchema) {
-      score -= 5;
-      deductions.push("No Schema.org Data: -5");
-    }
-    if (!technicalSEO.hasIdentitySchema) {
-      score -= 3;
-      deductions.push("No Identity Schema: -3");
-    }
-    if (!technicalSEO.hasAnalytics) {
-      score -= 3;
-      deductions.push("No Analytics Tool: -3");
+    scoreBreakdown.onPage = onPagePoints;
+    
+    // 🟧 TECHNICAL SEO — 25 POINTS
+    let technicalPoints = 0;
+    
+    // SSL (HTTPS) — 5 pts
+    if (technicalSEO.hasSSL) {
+      technicalPoints += 5;
+      scoreBreakdown.details.push("✓ HTTPS Enabled: +5");
+    } else {
+      scoreBreakdown.details.push("✗ No HTTPS: +0");
     }
     
-    // Basic SEO Elements
-    if (!metaTags.hasViewport) {
-      score -= 3;
-      deductions.push("No Viewport Meta: -3");
-    }
-    if (!metaTags.hasOgTags) {
-      score -= 2;
-      deductions.push("No Open Graph Tags: -2");
-    }
-    if (!metaTags.hasTwitterCard) {
-      score -= 2;
-      deductions.push("No Twitter Card: -2");
+    // robots.txt — 5 pts
+    if (technicalSEO.hasRobotsTxt) {
+      technicalPoints += 3;
+      scoreBreakdown.details.push("✓ robots.txt Exists: +3");
+      technicalPoints += 2;
+      scoreBreakdown.details.push("✓ robots.txt Proper Rules: +2");
+    } else {
+      scoreBreakdown.details.push("✗ No robots.txt: +0");
     }
     
-    // Links
-    if (linksData.total === 0) {
-      score -= 3;
-      deductions.push("No Links Found: -3");
-    } else if (linksData.internal === 0) {
-      score -= 2;
-      deductions.push("No Internal Links: -2");
+    // XML Sitemap — 5 pts
+    if (technicalSEO.hasSitemap) {
+      technicalPoints += 3;
+      scoreBreakdown.details.push("✓ XML Sitemap Exists: +3");
+      technicalPoints += 2;
+      scoreBreakdown.details.push("✓ Sitemap Accessible: +2");
+    } else {
+      scoreBreakdown.details.push("✗ No XML Sitemap: +0");
     }
     
-    // Ensure score doesn't go below 0
-    score = Math.max(0, score);
+    // Analytics Installed — 5 pts
+    if (technicalSEO.hasAnalytics) {
+      technicalPoints += 5;
+      scoreBreakdown.details.push("✓ Analytics Installed: +5");
+    } else {
+      scoreBreakdown.details.push("✗ No Analytics: +0");
+    }
     
-    console.log(`[ANALYZER] Score calculations:`, deductions);
+    // Schema (JSON-LD) — 5 pts
+    if (technicalSEO.hasSchema) {
+      technicalPoints += 3;
+      scoreBreakdown.details.push("✓ Schema.org Data Present: +3");
+      
+      if (technicalSEO.hasJsonLd) {
+        technicalPoints += 2;
+        scoreBreakdown.details.push("✓ Valid JSON-LD Schema: +2");
+      } else {
+        scoreBreakdown.details.push("⚠ Schema Not JSON-LD: +0");
+      }
+    } else {
+      scoreBreakdown.details.push("✗ No Schema.org Data: +0");
+    }
+    
+    scoreBreakdown.technical = technicalPoints;
+    
+    // 🟨 LOCAL SEO — 15 POINTS
+    let localPoints = 0;
+    
+    // Business Info (NAP) — 10 pts
+    if (hasPhone) {
+      localPoints += 5;
+      scoreBreakdown.details.push("✓ Phone Number Found: +5");
+    } else {
+      scoreBreakdown.details.push("✗ No Phone Number: +0");
+    }
+    
+    if (hasAddress) {
+      localPoints += 5;
+      scoreBreakdown.details.push("✓ Address Found: +5");
+    } else {
+      scoreBreakdown.details.push("✗ No Address: +0");
+    }
+    
+    // Local Business Schema — 5 pts
+    if (hasLocalBusinessSchema) {
+      localPoints += 5;
+      scoreBreakdown.details.push("✓ Local Business Schema: +5");
+    } else {
+      scoreBreakdown.details.push("✗ No Local Business Schema: +0");
+    }
+    
+    scoreBreakdown.local = localPoints;
+    
+    // 🟥 SOCIAL SIGNALS — 10 POINTS
+    let socialPoints = 0;
+    
+    // Social Links — 10 pts
+    let socialLinksCount = 0;
+    if (social.hasFacebookPage) socialLinksCount++;
+    if (social.hasInstagram) socialLinksCount++;
+    if (social.hasTwitter) socialLinksCount++;
+    if (social.hasLinkedIn) socialLinksCount++;
+    if (social.hasYouTube) socialLinksCount++;
+    
+    if (socialLinksCount >= 2) {
+      socialPoints += 10;
+      scoreBreakdown.details.push(`✓ Multiple Social Links (${socialLinksCount}): +10`);
+    } else if (socialLinksCount === 1) {
+      socialPoints += 5;
+      scoreBreakdown.details.push("⚠ One Social Link: +5");
+    } else {
+      scoreBreakdown.details.push("✗ No Social Links: +0");
+    }
+    
+    scoreBreakdown.social = socialPoints;
+    
+    // 🎯 FINAL SCORE CALCULATION
+    const score = scoreBreakdown.onPage + scoreBreakdown.technical + scoreBreakdown.local + scoreBreakdown.social;
+    
+    console.log(`[ANALYZER] Score Breakdown:`);
+    console.log(`  On-Page SEO: ${scoreBreakdown.onPage}/50`);
+    console.log(`  Technical SEO: ${scoreBreakdown.technical}/25`);
+    console.log(`  Local SEO: ${scoreBreakdown.local}/15`);
+    console.log(`  Social Signals: ${scoreBreakdown.social}/10`);
+    console.log(`  TOTAL: ${score}/100`);
 
     // Determine Grade
     let grade = "F";
@@ -692,51 +820,9 @@ export async function analyzeSEO(url) {
     else if (score >= 40) grade = "D";
     else if (score >= 35) grade = "D-";
 
-    // Calculate On-Page SEO Score - Start from 100 and deduct for issues
-    let onPageScore = 100;
+    // Calculate On-Page SEO Score section (for compatibility)
+    let onPageScore = Math.round((scoreBreakdown.onPage / 50) * 100);
     
-    // Title Tag - deduct up to 20 points
-    if (!metaTags.hasTitle) {
-      onPageScore -= 20;
-    } else if (metaTags.titleLength < 50 || metaTags.titleLength > 60) {
-      onPageScore -= 10;
-    }
-    
-    // Meta Description - deduct up to 20 points
-    if (!metaTags.hasDescription) {
-      onPageScore -= 20;
-    } else if (metaTags.descriptionLength < 120 || metaTags.descriptionLength > 160) {
-      onPageScore -= 10;
-    }
-    
-    // H1 Tag - deduct up to 10 points
-    if (!headings.hasH1) {
-      onPageScore -= 10;
-    } else if (headings.h1Count !== 1) {
-      onPageScore -= 5;
-    }
-    
-    // H2+ Tags - deduct up to 10 points
-    if (headings.h2Count === 0) {
-      onPageScore -= 10;
-    } else if (headings.h2Count === 1) {
-      onPageScore -= 5;
-    }
-    
-    // Image Alt - deduct based on percentage missing (up to 10 points)
-    const onPageAltDeduction = Math.round((100 - imagesData.altPercentage) / 10);
-    onPageScore -= onPageAltDeduction;
-    
-    // Technical SEO elements
-    if (!technicalSEO.hasSSL) onPageScore -= 10;
-    if (!technicalSEO.hasRobotsTxt) onPageScore -= 5;
-    if (!technicalSEO.hasSitemap) onPageScore -= 5;
-    if (!technicalSEO.hasSchema) onPageScore -= 5;
-    if (!technicalSEO.hasIdentitySchema) onPageScore -= 5;
-    
-    // Ensure score doesn't go below 0
-    onPageScore = Math.max(0, onPageScore);
-
     let onPageMessage = "";
     let onPageDescription = "";
     
@@ -893,6 +979,7 @@ export async function analyzeSEO(url) {
       url,
       score,
       grade,
+      scoreBreakdown,
       screenshot: `data:image/png;base64,${screenshotDesktop}`,
       screenshotMobile: `data:image/png;base64,${screenshotMobile}`,
       title,
