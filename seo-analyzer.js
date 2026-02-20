@@ -579,111 +579,93 @@ export async function analyzeSEO(url) {
       details: []
     };
 
-    // 🟦 ON-PAGE SEO — 50 POINTS
+    // 🟦 ON-PAGE SEO — 50 POINTS (VERY STRICT SCORING)
     let onPagePoints = 0;
     
-    // Title Tag — 10 pts
+    // Title Tag — 10 pts (must be perfect to get high score)
     if (metaTags.hasTitle) {
-      onPagePoints += 5;
-      scoreBreakdown.details.push("✓ Title Tag Exists: +5");
-      
       if (metaTags.titleLength >= 50 && metaTags.titleLength <= 60) {
-        onPagePoints += 5;
-        scoreBreakdown.details.push("✓ Title Length Optimal (50-60 chars): +5");
+        onPagePoints += 10;
+        scoreBreakdown.details.push("✓ Title Tag Perfect (optimal length 50-60): +10");
       } else {
-        scoreBreakdown.details.push(`⚠ Title Length Suboptimal (${metaTags.titleLength} chars): +0`);
+        onPagePoints += 2;
+        scoreBreakdown.details.push(`✗ Title Tag Not Optimal (${metaTags.titleLength} chars, need 50-60): +2`);
       }
     } else {
       scoreBreakdown.details.push("✗ Missing Title Tag: +0");
     }
     
-    // Meta Description — 10 pts
+    // Meta Description — 10 pts (must be perfect to get high score)
     if (metaTags.hasDescription) {
-      onPagePoints += 5;
-      scoreBreakdown.details.push("✓ Meta Description Exists: +5");
-      
       if (metaTags.descriptionLength >= 120 && metaTags.descriptionLength <= 160) {
-        onPagePoints += 5;
-        scoreBreakdown.details.push("✓ Description Length Optimal (120-160 chars): +5");
+        onPagePoints += 10;
+        scoreBreakdown.details.push("✓ Meta Description Perfect (optimal length 120-160): +10");
       } else {
-        scoreBreakdown.details.push(`⚠ Description Length Suboptimal (${metaTags.descriptionLength} chars): +0`);
+        onPagePoints += 2;
+        scoreBreakdown.details.push(`✗ Meta Description Not Optimal (${metaTags.descriptionLength} chars, need 120-160): +2`);
       }
     } else {
       scoreBreakdown.details.push("✗ Missing Meta Description: +0");
     }
     
-    // H1 Tag — 8 pts
+    // H1 Tag — 8 pts (must be perfect: exactly 1, good length)
     if (headings.h1Count === 1) {
-      onPagePoints += 5;
-      scoreBreakdown.details.push("✓ Exactly 1 H1 Tag: +5");
-      
-      // Check if H1 contains meaningful keywords (basic check)
-      if (headings.h1Text.length > 0 && headings.h1Text[0].length > 10) {
-        onPagePoints += 3;
-        scoreBreakdown.details.push("✓ H1 Contains Keywords: +3");
+      if (headings.h1Text.length > 0 && headings.h1Text[0].length >= 20) {
+        onPagePoints += 8;
+        scoreBreakdown.details.push("✓ Perfect H1 (exactly 1 with good length): +8");
       } else {
-        scoreBreakdown.details.push("⚠ H1 Too Short: +0");
+        onPagePoints += 1;
+        scoreBreakdown.details.push("✗ H1 Too Short (needs 20+ characters): +1");
       }
     } else if (headings.h1Count > 1) {
-      scoreBreakdown.details.push(`✗ Multiple H1 Tags (${headings.h1Count}): +0`);
+      onPagePoints += 1;
+      scoreBreakdown.details.push(`✗ Multiple H1 Tags (${headings.h1Count}, need exactly 1): +1`);
     } else {
       scoreBreakdown.details.push("✗ Missing H1 Tag: +0");
     }
     
-    // H2–H6 Headings — 7 pts
-    if (headings.h2Count > 0 && headings.h3Count >= 0) {
-      onPagePoints += 4;
-      scoreBreakdown.details.push("✓ Proper Heading Hierarchy: +4");
-      
-      // Check if keywords used naturally (has multiple heading levels)
-      if (headings.h2Count >= 2 || (headings.h2Count >= 1 && headings.h3Count >= 1)) {
-        onPagePoints += 3;
-        scoreBreakdown.details.push("✓ Keywords in Headings: +3");
-      } else {
-        scoreBreakdown.details.push("⚠ Limited Heading Structure: +0");
-      }
+    // H2–H6 Headings — 7 pts (need multiple levels)
+    if (headings.h2Count >= 3 && (headings.h3Count >= 2 || headings.h4Count >= 1)) {
+      onPagePoints += 7;
+      scoreBreakdown.details.push("✓ Excellent Heading Hierarchy (3+ H2, 2+ H3): +7");
+    } else if (headings.h2Count >= 2) {
+      onPagePoints += 2;
+      scoreBreakdown.details.push("✗ Basic Heading Structure (needs 3+ H2, 2+ H3): +2");
     } else {
-      scoreBreakdown.details.push("✗ Poor Heading Structure: +0");
+      scoreBreakdown.details.push("✗ Poor Heading Structure (no proper hierarchy): +0");
     }
     
-    // Image Alt Text — 5 pts
+    // Image Alt Text — 5 pts (must be 100% to get good score)
     if (imagesData.total > 0) {
       if (imagesData.altPercentage === 100) {
-        onPagePoints += 3;
-        scoreBreakdown.details.push("✓ All Images Have Alt Text: +3");
-        onPagePoints += 2;
-        scoreBreakdown.details.push("✓ Alt Text Quality Good: +2");
-      } else if (imagesData.altPercentage >= 80) {
-        onPagePoints += 3;
-        scoreBreakdown.details.push("✓ Most Images Have Alt Text: +3");
+        onPagePoints += 5;
+        scoreBreakdown.details.push("✓ All Images Have Alt Text (100%): +5");
       } else if (imagesData.altPercentage >= 50) {
-        onPagePoints += 2;
-        scoreBreakdown.details.push("⚠ Some Images Have Alt Text: +2");
+        onPagePoints += 1;
+        scoreBreakdown.details.push(`✗ Only ${imagesData.altPercentage.toFixed(0)}% Images Have Alt (need 100%): +1`);
       } else {
-        scoreBreakdown.details.push(`✗ Few Images Have Alt (${imagesData.altPercentage.toFixed(0)}%): +0`);
+        scoreBreakdown.details.push(`✗ Only ${imagesData.altPercentage.toFixed(0)}% Images Have Alt: +0`);
       }
     } else {
-      scoreBreakdown.details.push("⚠ No Images Found: +0");
+      onPagePoints += 2;
+      scoreBreakdown.details.push("⚠ No Images Found: +2");
     }
     
-    // Content Quality — 10 pts
-    if (content.wordCount >= 300) {
+    // Content Quality — 10 pts (need substantial content)
+    if (content.wordCount >= 1000) {
+      onPagePoints += 10;
+      scoreBreakdown.details.push(`✓ Excellent Content Length (${content.wordCount} words): +10`);
+    } else if (content.wordCount >= 500) {
       onPagePoints += 4;
-      scoreBreakdown.details.push(`✓ Sufficient Content (${content.wordCount} words): +4`);
-      onPagePoints += 3;
-      scoreBreakdown.details.push("✓ Keyword Usage Natural: +3");
-      onPagePoints += 3;
-      scoreBreakdown.details.push("✓ Content Readable: +3");
-    } else if (content.wordCount >= 150) {
-      onPagePoints += 3;
-      scoreBreakdown.details.push(`⚠ Moderate Content (${content.wordCount} words): +3`);
-      onPagePoints += 2;
-      scoreBreakdown.details.push("⚠ Keyword Usage Fair: +2");
+      scoreBreakdown.details.push(`✗ Content Too Short (${content.wordCount} words, need 1000+): +4`);
+    } else if (content.wordCount >= 300) {
+      onPagePoints += 1;
+      scoreBreakdown.details.push(`✗ Very Low Content (${content.wordCount} words, need 1000+): +1`);
     } else if (content.wordCount >= 50) {
-      onPagePoints += 2;
-      scoreBreakdown.details.push(`⚠ Low Content (${content.wordCount} words): +2`);
+      onPagePoints += 1;
+      scoreBreakdown.details.push(`✗ Very Low Content (${content.wordCount} words): +1`);
     } else {
-      scoreBreakdown.details.push(`✗ Very Low Content (${content.wordCount} words): +0`);
+      scoreBreakdown.details.push(`✗ Minimal Content (${content.wordCount} words): +0`);
     }
     
     scoreBreakdown.onPage = onPagePoints;
@@ -860,54 +842,91 @@ export async function analyzeSEO(url) {
     // Generate Recommendations
     const recommendations = [];
 
-    if (!social.hasFacebookPage) {
+    // HIGH PRIORITY - On-Page SEO
+    if (!metaTags.hasTitle) {
       recommendations.push({
-        title: "Create and link your Facebook Page",
-        category: "Social",
-        priority: "Low Priority",
-      });
-    }
-
-    if (!social.hasInstagram) {
-      recommendations.push({
-        title: "Create and link an associated Instagram Profile",
-        category: "Social",
-        priority: "Low Priority",
-      });
-    }
-
-    if (!technicalSEO.hasAnalytics) {
-      recommendations.push({
-        title: "Implement an Analytics Tracking Tool",
+        title: "Add a Title Tag to your page",
         category: "On-Page SEO",
-        priority: "Low Priority",
+        priority: "High Priority",
+      });
+    } else if (metaTags.titleLength < 50 || metaTags.titleLength > 60) {
+      if (metaTags.titleLength < 50) {
+        recommendations.push({
+          title: `Increase Title Tag length from ${metaTags.titleLength} to 50-60 characters`,
+          category: "On-Page SEO",
+          priority: "High Priority",
+        });
+      } else {
+        recommendations.push({
+          title: `Shorten Title Tag length from ${metaTags.titleLength} to 50-60 characters`,
+          category: "On-Page SEO",
+          priority: "High Priority",
+        });
+      }
+    }
+
+    if (!metaTags.hasDescription) {
+      recommendations.push({
+        title: "Add a Meta Description to your page",
+        category: "On-Page SEO",
+        priority: "High Priority",
+      });
+    } else if (metaTags.descriptionLength < 120 || metaTags.descriptionLength > 160) {
+      if (metaTags.descriptionLength < 120) {
+        recommendations.push({
+          title: `Increase Meta Description length from ${metaTags.descriptionLength} to 120-160 characters`,
+          category: "On-Page SEO",
+          priority: "High Priority",
+        });
+      } else {
+        recommendations.push({
+          title: `Shorten Meta Description length from ${metaTags.descriptionLength} to 120-160 characters`,
+          category: "On-Page SEO",
+          priority: "High Priority",
+        });
+      }
+    }
+
+    if (headings.h1Count === 0) {
+      recommendations.push({
+        title: "Add exactly one H1 Header Tag to your page",
+        category: "On-Page SEO",
+        priority: "High Priority",
+      });
+    } else if (headings.h1Count > 1) {
+      recommendations.push({
+        title: `Reduce H1 tags from ${headings.h1Count} to exactly 1`,
+        category: "On-Page SEO",
+        priority: "High Priority",
       });
     }
 
-    if (!localSEO.hasLocalBusinessSchema) {
+    // MEDIUM PRIORITY - On-Page SEO
+    if (headings.h2Count < 2) {
       recommendations.push({
-        title: "Add Local Business Schema",
-        category: "Local SEO",
-        priority: "Low Priority",
-      });
-    }
-
-    if (!localSEO.hasPhone) {
-      recommendations.push({
-        title: "Add Phone Number to Website",
-        category: "Local SEO",
+        title: "Add more H2-H6 heading tags to improve content structure",
+        category: "On-Page SEO",
         priority: "Medium Priority",
       });
     }
 
-    if (!localSEO.hasAddress) {
+    if (imagesData.total > 0 && imagesData.altPercentage < 100) {
       recommendations.push({
-        title: "Add Address Information to Website",
-        category: "Local SEO",
+        title: `Add Alt Attributes to ${imagesData.withoutAlt} images (${(100 - imagesData.altPercentage).toFixed(0)}% missing)`,
+        category: "On-Page SEO",
         priority: "Medium Priority",
       });
     }
 
+    if (content.wordCount < 300) {
+      recommendations.push({
+        title: `Increase content length from ${content.wordCount} to at least 300 words`,
+        category: "On-Page SEO",
+        priority: "Medium Priority",
+      });
+    }
+
+    // TECHNICAL SEO
     if (!technicalSEO.hasRobotsTxt) {
       recommendations.push({
         title: "Create a robots.txt file",
@@ -924,51 +943,69 @@ export async function analyzeSEO(url) {
       });
     }
 
-    if (!metaTags.hasDescription || metaTags.descriptionLength < 120 || metaTags.descriptionLength > 160) {
+    if (!technicalSEO.hasAnalytics) {
       recommendations.push({
-        title: "Optimize Meta Description",
-        category: "On-Page SEO",
-        priority: "High Priority",
+        title: "Implement an Analytics Tracking Tool",
+        category: "Technical SEO",
+        priority: "Low Priority",
       });
     }
 
-    if (!metaTags.hasTitle || metaTags.titleLength < 50 || metaTags.titleLength > 60) {
+    if (!technicalSEO.hasSchema) {
       recommendations.push({
-        title: "Increase length of Title Tag",
-        category: "On-Page SEO",
-        priority: "High Priority",
-      });
-    }
-
-    if (headings.h1Count !== 1) {
-      recommendations.push({
-        title: "Add H1 Header Tag",
-        category: "On-Page SEO",
-        priority: "High Priority",
-      });
-    }
-
-    if (imagesData.altPercentage < 100) {
-      recommendations.push({
-        title: "Add Alt Attributes to all images",
-        category: "On-Page SEO",
+        title: "Add Schema.org Structured Data",
+        category: "Technical SEO",
         priority: "Medium Priority",
       });
     }
 
     if (!technicalSEO.hasIdentitySchema) {
       recommendations.push({
-        title: "Add Identity Schema",
+        title: "Add Identity Schema (Organization or Person)",
         category: "Technical SEO",
         priority: "Medium Priority",
       });
     }
-    
-    if (!technicalSEO.hasSchema) {
+
+    // LOCAL SEO
+    if (!localSEO.hasPhone) {
       recommendations.push({
-        title: "Add Schema.org Structured Data",
-        category: "Technical SEO",
+        title: "Add Phone Number to Website",
+        category: "Local SEO",
         priority: "Medium Priority",
+      });
+    }
+
+    if (!localSEO.hasAddress) {
+      recommendations.push({
+        title: "Add Address Information to Website",
+        category: "Local SEO",
+        priority: "Medium Priority",
+      });
+    }
+
+    if (!localSEO.hasLocalBusinessSchema) {
+      recommendations.push({
+        title: "Add Local Business Schema",
+        category: "Local SEO",
+        priority: "Low Priority",
+      });
+    }
+
+    // SOCIAL
+    if (!social.hasFacebookPage) {
+      recommendations.push({
+        title: "Create and link your Facebook Page",
+        category: "Social",
+        priority: "Low Priority",
+      });
+    }
+
+    if (!social.hasInstagram) {
+      recommendations.push({
+        title: "Create and link an associated Instagram Profile",
+        category: "Social",
+        priority: "Low Priority",
       });
     }
 
