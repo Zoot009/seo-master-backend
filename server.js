@@ -21,6 +21,7 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { analyzeSEO } from './seo-analyzer.js';
 import { validateSchema } from './schema-validator.js';
+import { generatePDF } from './pdf-generator.js';
 
 dotenv.config();
 
@@ -47,7 +48,9 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json());
+// Increase body size limit for large reports with screenshots
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // API Key authentication middleware
 const authenticateApiKey = (req, res, next) => {
@@ -129,6 +132,53 @@ app.post('/api/validate-schema', authenticateApiKey, async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to validate schema markup'
+    });
+  }
+});
+
+// PDF Generation endpoint (auth required)
+app.post('/api/generate-pdf', authenticateApiKey, async (req, res) => {
+  try {
+    const { reportData } = req.body;
+
+    // Validate report data
+    if (!reportData || typeof reportData !== 'object') {
+      return res.status(400).json({ error: 'Report data is required' });
+    }
+
+    console.log(`[BACKEND] Starting PDF generation for: ${reportData.url || 'Unknown URL'}`);
+    console.log(`[BACKEND] Report data size: ${JSON.stringify(reportData).length} bytes`);
+
+    // Generate PDF
+    let pdfBuffer = await generatePDF(reportData);
+
+    // Ensure it's a Buffer (convert from Uint8Array if needed)
+    if (!Buffer.isBuffer(pdfBuffer)) {
+      pdfBuffer = Buffer.from(pdfBuffer);
+    }
+
+    console.log(`[BACKEND] PDF generation completed, buffer size: ${pdfBuffer.length} bytes`);
+
+    // Validate PDF buffer
+    if (pdfBuffer.length === 0) {
+      throw new Error('Invalid PDF buffer generated - empty buffer');
+    }
+
+    // Set headers for PDF download
+    const hostname = reportData.url ? reportData.url.replace(/^https?:\/\//, '').replace(/\//g, '-') : 'report';
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="seo-report-${hostname}.pdf"`);
+    res.setHeader('Content-Length', pdfBuffer.length);
+
+    // Send PDF
+    res.send(pdfBuffer);
+
+  } catch (error) {
+    console.error('[BACKEND] PDF generation error:', error);
+    console.error('[BACKEND] Error stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to generate PDF'
     });
   }
 });
