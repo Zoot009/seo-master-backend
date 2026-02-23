@@ -810,7 +810,7 @@ export async function analyzeSEO(url) {
     else if (score >= 35) grade = "D-";
 
     // Calculate On-Page SEO Score section (for compatibility)
-    let onPageScore = Math.round((scoreBreakdown.onPage / 50) * 100);
+    let onPageScore = Math.round((scoreBreakdown.onPage / 45) * 100);
     
     let onPageMessage = "";
     let onPageDescription = "";
