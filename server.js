@@ -22,6 +22,7 @@ import dotenv from 'dotenv';
 import { analyzeSEO } from './seo-analyzer.js';
 import { validateSchema } from './schema-validator.js';
 import { generatePDF } from './pdf-generator.js';
+import { crawlSite } from './site-crawler.js';
 
 dotenv.config();
 
@@ -179,6 +180,39 @@ app.post('/api/generate-pdf', authenticateApiKey, async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to generate PDF'
+    });
+  }
+});
+
+// Site Crawl endpoint — discovers and audits every page on a website
+app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
+  try {
+    const { url, concurrency } = req.body;
+
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'url is required and must be a string' });
+    }
+
+    const options = {
+      concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : 10,
+    };
+
+    console.log(`[BACKEND] Starting site crawl for: ${url}`);
+
+    const result = await crawlSite(url, options);
+
+    console.log(`[BACKEND] Site crawl completed: ${result.pages.length} pages`);
+
+    res.json({
+      success: true,
+      data: result,
+    });
+
+  } catch (error) {
+    console.error('[BACKEND] Site crawl error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to crawl site',
     });
   }
 });

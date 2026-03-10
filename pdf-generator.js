@@ -554,13 +554,7 @@ function generateHTMLReport(data) {
         </a>
       </h1>
       <p class="intro-text">
-        This report grades your website on the strength of a range of
-        important factors such as on-page SEO optimization, off-page
-        backlinks, social, performance, security and more. The overall
-        grade is on a A+ to F- scale, with most major industry leading
-        websites in the A range. Improving a website's grade is
-        recommended to ensure a better website experience for your users
-        and improved ranking and visibility by search engines.
+        This report analyzes your website across several important areas, including on-page SEO,social presence, performance, security, and technical configuration. The purpose of this analysis is to highlight strengths and identify areas that may benefit from improvement. Addressing the recommendations in this report can help enhance user experience, search engine visibility, and overall website performance.
       </p>
     </div>
 
