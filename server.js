@@ -19,6 +19,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
+import puppeteer from 'puppeteer';
 import { analyzeSEO } from './seo-analyzer.js';
 import { validateSchema } from './schema-validator.js';
 import { generatePDF } from './pdf-generator.js';
@@ -214,6 +215,70 @@ app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
       success: false,
       error: error.message || 'Failed to crawl site',
     });
+  }
+});
+
+// Lighthouse Performance endpoint — runs real Lighthouse audit on any URL
+app.post('/api/lighthouse', authenticateApiKey, async (req, res) => {
+  const { url } = req.body;
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required' });
+  }
+
+  let chrome;
+  try {
+    console.log(`[LIGHTHOUSE] Starting audit for: ${url}`);
+
+    const { launch } = await import('chrome-launcher');
+    const { default: lighthouse } = await import('lighthouse');
+
+    chrome = await launch({ chromeFlags: ['--headless', '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
+
+    const runAudit = async (strategy) => {
+      const cfg = {
+        extends: 'lighthouse:default',
+        settings: {
+          onlyCategories: ['performance'],
+          formFactor: strategy,
+          screenEmulation: strategy === 'desktop'
+            ? { mobile: false, width: 1350, height: 940, deviceScaleFactor: 1, disabled: false }
+            : { mobile: true, width: 375, height: 667, deviceScaleFactor: 2, disabled: false },
+          throttlingMethod: 'simulate',
+        },
+      };
+      const result = await lighthouse(url, { port: chrome.port, output: 'json', logLevel: 'error' }, cfg);
+      return result.lhr;
+    };
+
+    // Must run sequentially — Lighthouse cannot handle concurrent audits on the same Chrome instance
+    const desktopLhr = await runAudit('desktop');
+    const mobileLhr  = await runAudit('mobile');
+
+    const extractMetrics = (lhr) => {
+      const a = lhr.audits;
+      const score = Math.round((lhr.categories?.performance?.score ?? 0) * 100);
+      const fmt = (key) => a[key]?.displayValue ?? 'N/A';
+      const num = (key) => a[key]?.numericValue ?? 0;
+      return {
+        score,
+        lcp: fmt('largest-contentful-paint'),  lcpVal: num('largest-contentful-paint'),
+        tbt: fmt('total-blocking-time'),        tbtVal: num('total-blocking-time'),
+        cls: fmt('cumulative-layout-shift'),    clsVal: num('cumulative-layout-shift'),
+        fcp: fmt('first-contentful-paint'),
+        si:  fmt('speed-index'),
+      };
+    };
+
+    console.log(`[LIGHTHOUSE] Audit completed for: ${url}`);
+    res.json({ success: true, desktop: extractMetrics(desktopLhr), mobile: extractMetrics(mobileLhr) });
+
+  } catch (error) {
+    console.error('[LIGHTHOUSE] Error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (chrome) {
+      try { await chrome.kill(); } catch (_) {}
+    }
   }
 });
 
