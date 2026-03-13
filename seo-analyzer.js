@@ -411,43 +411,87 @@ export async function analyzeSEO(url) {
     };
 
     // Analyze Local SEO - Phone and Address Detection
-    // Enhanced phone number detection with multiple patterns
-    const phonePatterns = [
-      // US/Canada formats with country code
-      /\+1[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g,
-      // Standard US format variations
-      /\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g,
-      // International format
-      /\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}/g,
-      // Dot separated or space separated
-      /\d{3}[.\s]\d{3}[.\s]\d{4}/g,
-    ];
-    
-    let phoneMatches = [];
-    for (const pattern of phonePatterns) {
-      const matches = bodyText.matchAll(pattern);
-      for (const match of matches) {
-        phoneMatches.push({ source: 'bodyText', value: match[0] });
-      }
-    }
-    
-    // Also check for tel: links in HTML for better accuracy
-    const telLinks = $('a[href^="tel:"]');
-    telLinks.each((_, el) => {
-      const telHref = $(el).attr('href');
-      const displayText = $(el).text().trim();
-      if (displayText && /\d/.test(displayText)) {
-        phoneMatches.unshift({ source: 'tel:link', value: displayText });
-      }
-    });
-    
-    // Use the first phone number found (exact format)
+    // Phone detection — ordered by confidence (highest first):
+    //   1. Schema.org structured data
+    //   2. tel: links (explicit, unambiguous)
+    //   3. Contact/footer elements with phone-like patterns
+    //   4. Full bodyText regex with strict word boundaries (last resort)
+
+    // Strict phone regex with word boundaries to avoid matching partial numbers
+    const phoneRegexStrict = /(?<!\d)(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}(?!\d)/g;
+    const intlPhoneRegex = /(?<!\d)\+(?!1\b)\d{1,3}[-.\s]\d{2,5}[-.\s]\d{3,5}(?:[-.\s]\d{1,5})?(?!\d)/g;
+
+    const extractPhoneFromText = (text) => {
+      phoneRegexStrict.lastIndex = 0;
+      intlPhoneRegex.lastIndex = 0;
+      const m = phoneRegexStrict.exec(text) || intlPhoneRegex.exec(text);
+      return m ? m[0].trim() : null;
+    };
+
     let validPhone = null;
-    if (phoneMatches.length > 0) {
-      validPhone = phoneMatches[0].value;
-      console.log(`[ANALYZER] Phone: "${validPhone}"`);
+
+    // 1. Schema.org
+    if (!validPhone && ldJsonScripts.length > 0) {
+      ldJsonScripts.each((_, el) => {
+        if (validPhone) return false;
+        try {
+          const schema = JSON.parse($(el).html());
+          const findPhone = (obj) => {
+            if (!obj || typeof obj !== 'object') return null;
+            if (typeof obj.telephone === 'string' && obj.telephone.length > 6) return obj.telephone;
+            for (const val of Object.values(obj)) {
+              const found = findPhone(val);
+              if (found) return found;
+            }
+            return null;
+          };
+          const p = findPhone(schema);
+          if (p) validPhone = p;
+        } catch { /* skip */ }
+      });
     }
-    
+
+    // 2. tel: links — most reliable HTML signal
+    if (!validPhone) {
+      $('a[href^="tel:"]').each((_, el) => {
+        if (validPhone) return false;
+        const displayText = $(el).text().trim();
+        const hrefVal = ($(el).attr('href') || '').replace('tel:', '').trim();
+        const candidate = displayText && /\d/.test(displayText) ? displayText : hrefVal;
+        if (candidate && /\d{7,}/.test(candidate.replace(/\D/g, ''))) {
+          validPhone = candidate;
+        }
+      });
+    }
+
+    // 3. Contact / footer elements
+    if (!validPhone) {
+      const contactSelectors = [
+        'footer', '[class*="contact"]', '#contact', '[class*="phone"]',
+        '[class*="tel"]', '[itemprop="telephone"]', '[class*="footer"]',
+      ];
+      for (const sel of contactSelectors) {
+        if (validPhone) break;
+        $(sel).each((_, el) => {
+          if (validPhone) return false;
+          const elText = $(el).text().replace(/\s+/g, ' ');
+          const found = extractPhoneFromText(elText);
+          if (found) validPhone = found;
+        });
+      }
+    }
+
+    // 4. Full bodyText — strict patterns only to avoid false positives
+    if (!validPhone) {
+      validPhone = extractPhoneFromText(bodyText);
+    }
+
+    if (validPhone) {
+      console.log(`[ANALYZER] Phone: "${validPhone}"`);
+    } else {
+      console.log(`[ANALYZER] Phone: Not found`);
+    }
+
     const hasPhone = validPhone !== null;
     const phoneNumber = validPhone;
 
