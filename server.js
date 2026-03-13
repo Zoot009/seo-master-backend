@@ -20,16 +20,27 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import puppeteer from 'puppeteer';
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import pkg from 'pg';
 import { analyzeSEO } from './seo-analyzer.js';
 import { validateSchema } from './schema-validator.js';
 import { generatePDF } from './pdf-generator.js';
 import { crawlSite } from './site-crawler.js';
+
+const { Pool } = pkg;
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const API_KEY = process.env.API_KEY;
+
+// DB pool for backlink storage
+const dbPool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('supabase') ? { rejectUnauthorized: false } : false,
+});
 
 // Security middleware
 app.use(helmet());
@@ -279,6 +290,113 @@ app.post('/api/lighthouse', authenticateApiKey, async (req, res) => {
     if (chrome) {
       try { await chrome.kill(); } catch (_) {}
     }
+  }
+});
+
+// Backlink Crawler endpoint — crawls a site and discovers all internal + external links
+app.post('/api/crawl-backlinks', authenticateApiKey, async (req, res) => {
+  const { url, maxPages = 40, maxDepth = 2 } = req.body;
+
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required' });
+  }
+
+  let startUrl;
+  try {
+    startUrl = new URL(url.startsWith('http') ? url : 'https://' + url);
+  } catch {
+    return res.status(400).json({ error: 'Invalid URL provided' });
+  }
+
+  const baseDomain = startUrl.hostname;
+  console.log(`[BACKLINK] Starting crawl for: ${baseDomain} (max ${maxPages} pages)`);
+
+  try {
+    // Clear old data for this domain so results are always fresh
+    await dbPool.query('DELETE FROM backlinks WHERE target_domain = $1', [baseDomain]);
+
+    const visited = new Set();
+    const queue = [startUrl.href];
+    const allLinks = [];
+    let pagesCrawled = 0;
+
+    while (queue.length > 0 && pagesCrawled < maxPages) {
+      const pageUrl = queue.shift();
+      if (visited.has(pageUrl)) continue;
+      visited.add(pageUrl);
+      pagesCrawled++;
+
+      try {
+        const { data: html } = await axios.get(pageUrl, {
+          timeout: 12000,
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SEOmaster-Crawler/1.0)' },
+          maxRedirects: 3,
+        });
+
+        const $ = cheerio.load(html);
+
+        $('a[href]').each((_, el) => {
+          const href = $(el).attr('href');
+          if (!href || href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('#') || href.startsWith('javascript:')) return;
+
+          try {
+            const linkUrl = new URL(href, pageUrl);
+            if (!linkUrl.protocol.startsWith('http')) return;
+
+            const relAttr = ($(el).attr('rel') || '').toLowerCase().split(/\s+/);
+            const isNoFollow = relAttr.includes('nofollow') || relAttr.includes('ugc') || relAttr.includes('sponsored');
+            const anchorText = $(el).text().trim().replace(/\s+/g, ' ').slice(0, 200) || '[No Anchor Text]';
+
+            allLinks.push({
+              source_url: pageUrl,
+              target_url: linkUrl.href,
+              target_domain: baseDomain,
+              anchor_text: anchorText,
+              is_nofollow: isNoFollow,
+              link_domain: linkUrl.hostname,
+            });
+
+            // Only follow links within the same domain to build the crawl
+            if (linkUrl.hostname === baseDomain && !visited.has(linkUrl.href) && queue.length < maxPages * 2) {
+              queue.push(linkUrl.href);
+            }
+          } catch {}
+        });
+
+        console.log(`[BACKLINK] Crawled (${pagesCrawled}/${maxPages}): ${pageUrl}`);
+      } catch (err) {
+        console.log(`[BACKLINK] Skipped ${pageUrl}: ${err.message}`);
+      }
+    }
+
+    // Deduplicate by source+target
+    const unique = new Map();
+    for (const link of allLinks) {
+      const key = `${link.source_url}=>${link.target_url}`;
+      unique.set(key, link);
+    }
+    const toSave = Array.from(unique.values());
+
+    // Batch insert
+    for (const link of toSave) {
+      await dbPool.query(
+        'INSERT INTO backlinks (source_url, target_url, target_domain) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+        [link.source_url, link.target_url, link.target_domain]
+      );
+    }
+
+    console.log(`[BACKLINK] Done: ${pagesCrawled} pages crawled, ${toSave.length} links saved for ${baseDomain}`);
+
+    res.json({
+      success: true,
+      domain: baseDomain,
+      pagesCrawled,
+      totalLinks: toSave.length,
+      links: toSave,
+    });
+  } catch (error) {
+    console.error('[BACKLINK] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

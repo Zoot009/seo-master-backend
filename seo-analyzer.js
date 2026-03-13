@@ -531,20 +531,50 @@ export async function analyzeSEO(url) {
       });
       
       // Look for elements with address-related classes or IDs
+      // Also check footer and semantic <address> elements — addresses are commonly placed there
       const addressSelectors = [
+        'address',                          // HTML semantic <address> element
+        'footer address',                   // <address> inside footer
+        'footer [itemprop*="address"]',     // Microdata inside footer
         '.address', '#address', '[class*="address"]',
         '.location', '#location', '[class*="location"]',
-        '.contact-info', '.contact-address'
+        '.contact-info', '.contact-address',
+        'footer [class*="contact"]',        // Contact blocks in footer
+        'footer [class*="address"]',        // Address blocks in footer
+        'footer [class*="location"]',       // Location blocks in footer
+        '[class*="footer"] [class*="address"]',
+        '[class*="footer"] [class*="contact"]'
       ];
       
       addressSelectors.forEach(selector => {
         $(selector).each((_, el) => {
           const addrText = $(el).text().trim().replace(/\s+/g, ' ');
-          if (addrText.length > 15 && addrText.length < 200 && /\d/.test(addrText)) {
+          if (addrText.length > 10 && addrText.length < 300 && /\d/.test(addrText)) {
             addressCandidates.push({ text: addrText, source: `CSS selector: ${selector}` });
           }
         });
       });
+
+      // Scan individual text nodes inside footer for address-like patterns
+      // This catches addresses in plain <p> or <span> tags with no special classes
+      if (addressCandidates.length === 0) {
+        $('footer p, footer span, footer li, footer div').each((_, el) => {
+          // Only look at leaf-like nodes to avoid capturing entire footer blocks
+          const children = $(el).children().length;
+          if (children > 3) return;
+          const elText = $(el).text().trim().replace(/\s+/g, ' ');
+          if (elText.length < 10 || elText.length > 250) return;
+          usAddressRegex.lastIndex = 0;
+          poBoxRegex.lastIndex = 0;
+          if (usAddressRegex.test(elText) || poBoxRegex.test(elText)) {
+            addressCandidates.push({ text: elText, source: 'footer element pattern match' });
+          }
+          // Also match generic number + word pattern typical of any address line
+          if (/\d{1,5}\s+\w/.test(elText) && /,/.test(elText) && /\d/.test(elText)) {
+            addressCandidates.push({ text: elText, source: 'footer generic address pattern' });
+          }
+        });
+      }
       
       // Use the first address found
       if (addressCandidates.length > 0) {
