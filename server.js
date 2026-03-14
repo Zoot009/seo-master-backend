@@ -36,6 +36,50 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const API_KEY = process.env.API_KEY;
 
+// ---------------------------------------------------------------------------
+// Concurrency limiter — prevents the server from spawning too many Chrome
+// instances simultaneously.  When the limit is reached, new requests wait
+// in a queue (up to QUEUE_TIMEOUT ms) before being rejected with 503.
+// ---------------------------------------------------------------------------
+const MAX_CONCURRENT_ANALYSES = parseInt(process.env.MAX_CONCURRENT_ANALYSES || "3", 10);
+const QUEUE_TIMEOUT_MS        = parseInt(process.env.QUEUE_TIMEOUT_MS        || "120000", 10); // 2 min
+
+class Semaphore {
+  constructor(max) {
+    this.max   = max;
+    this.count = 0;
+    this.queue = [];
+  }
+  acquire() {
+    if (this.count < this.max) {
+      this.count++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this.queue.findIndex(q => q.resolve === resolve);
+        if (idx !== -1) this.queue.splice(idx, 1);
+        reject(new Error("Server is busy — too many concurrent analyses. Please try again in a moment."));
+      }, QUEUE_TIMEOUT_MS);
+      this.queue.push({ resolve, timer });
+    });
+  }
+  release() {
+    this.count = Math.max(0, this.count - 1);
+    const next = this.queue.shift();
+    if (next) {
+      clearTimeout(next.timer);
+      this.count++;
+      next.resolve();
+    }
+  }
+  get queued() { return this.queue.length; }
+  get active() { return this.count; }
+}
+
+const analysisSemaphore = new Semaphore(MAX_CONCURRENT_ANALYSES);
+const crawlSemaphore    = new Semaphore(Math.max(1, MAX_CONCURRENT_ANALYSES - 1));
+
 // DB pool for backlink storage
 const dbPool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -81,40 +125,69 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'SEO Analyzer Backend',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    queue: {
+      analysis: { active: analysisSemaphore.active, queued: analysisSemaphore.queued, max: analysisSemaphore.max },
+      crawl:    { active: crawlSemaphore.active,    queued: crawlSemaphore.queued,    max: crawlSemaphore.max },
+    },
   });
 });
 
 // SEO Analysis endpoint (auth required)
 app.post('/api/analyze', authenticateApiKey, async (req, res) => {
+  const { url, reportId } = req.body;
+
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'URL is required and must be a string' });
+  }
+
+  console.log(`[BACKEND] Queuing SEO analysis for: ${url} (active=${analysisSemaphore.active}, queued=${analysisSemaphore.queued})`);
+
   try {
-    const { url, reportId } = req.body;
+    await analysisSemaphore.acquire();
+  } catch (queueErr) {
+    console.warn(`[BACKEND] Queue rejected: ${queueErr.message}`);
+    return res.status(503).json({ success: false, error: queueErr.message, reportId });
+  }
 
-    // Validate URL
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({ error: 'URL is required and must be a string' });
+  // Hard cap: 90s per analysis — prevents one hung Chrome from blocking the queue forever
+  const ANALYSIS_TIMEOUT_MS = parseInt(process.env.ANALYSIS_TIMEOUT_MS || "90000", 10);
+
+  let released = false;
+  const release = () => { if (!released) { released = true; analysisSemaphore.release(); } };
+
+  const timeoutHandle = setTimeout(() => {
+    release();
+    if (!res.headersSent) {
+      res.status(504).json({
+        success: false,
+        error: 'Analysis timed out — the target website took too long to respond.',
+        reportId,
+      });
     }
+  }, ANALYSIS_TIMEOUT_MS);
 
+  try {
     console.log(`[BACKEND] Starting SEO analysis for: ${url} (Report ID: ${reportId || 'N/A'})`);
-
-    // Perform SEO analysis
     const result = await analyzeSEO(url);
-
+    clearTimeout(timeoutHandle);
+    release();
     console.log(`[BACKEND] Analysis completed for: ${url}`);
 
-    res.json({
-      success: true,
-      data: result,
-      reportId
-    });
-
+    if (!res.headersSent) {
+      res.json({ success: true, data: result, reportId });
+    }
   } catch (error) {
+    clearTimeout(timeoutHandle);
+    release();
     console.error('[BACKEND] Analysis error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to analyze website',
-      reportId: req.body.reportId
-    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: error.message || 'Failed to analyze website',
+        reportId,
+      });
+    }
   }
 });
 
@@ -198,34 +271,53 @@ app.post('/api/generate-pdf', authenticateApiKey, async (req, res) => {
 
 // Site Crawl endpoint — discovers and audits every page on a website
 app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
+  const { url, concurrency } = req.body;
+
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required and must be a string' });
+  }
+
+  console.log(`[BACKEND] Queuing site crawl for: ${url} (active=${crawlSemaphore.active}, queued=${crawlSemaphore.queued})`);
+
   try {
-    const { url, concurrency } = req.body;
+    await crawlSemaphore.acquire();
+  } catch (queueErr) {
+    return res.status(503).json({ success: false, error: queueErr.message });
+  }
 
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({ error: 'url is required and must be a string' });
+  const CRAWL_TIMEOUT_MS = parseInt(process.env.CRAWL_TIMEOUT_MS || "300000", 10); // 5 min
+
+  let released = false;
+  const release = () => { if (!released) { released = true; crawlSemaphore.release(); } };
+
+  const timeoutHandle = setTimeout(() => {
+    release();
+    if (!res.headersSent) {
+      res.status(504).json({ success: false, error: 'Site crawl timed out.' });
     }
+  }, CRAWL_TIMEOUT_MS);
 
+  try {
     const options = {
       concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : 10,
     };
 
     console.log(`[BACKEND] Starting site crawl for: ${url}`);
-
     const result = await crawlSite(url, options);
-
+    clearTimeout(timeoutHandle);
+    release();
     console.log(`[BACKEND] Site crawl completed: ${result.pages.length} pages`);
 
-    res.json({
-      success: true,
-      data: result,
-    });
-
+    if (!res.headersSent) {
+      res.json({ success: true, data: result });
+    }
   } catch (error) {
+    clearTimeout(timeoutHandle);
+    release();
     console.error('[BACKEND] Site crawl error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to crawl site',
-    });
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: error.message || 'Failed to crawl site' });
+    }
   }
 });
 

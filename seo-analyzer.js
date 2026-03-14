@@ -13,7 +13,6 @@ export async function analyzeSEO(url) {
   let browser;
   try {
     console.log(`[ANALYZER] Launching Puppeteer browser...`);
-    // Launch Puppeteer browser
     browser = await puppeteer.launch({
       headless: true,
       args: [
@@ -21,21 +20,47 @@ export async function analyzeSEO(url) {
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--single-process",
+        "--no-zygote",
       ],
     });
     console.log(`[ANALYZER] Browser launched successfully`);
 
     const page = await browser.newPage();
+
+    // Block heavy resources we don't need for SEO analysis — speeds up load and reduces hangs
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const type = req.resourceType();
+      if (["media", "font", "websocket"].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
     await page.setViewport({ width: 1920, height: 1080 });
 
     // Start timing
     const startTime = Date.now();
 
-    // Navigate to the page
+    // Navigate — use domcontentloaded so we don't wait forever on ad-heavy pages.
+    // If that resolves but the page's own JS hasn't rendered body yet, fall back to
+    // a short networkidle2 wait capped at 8s.
     console.log(`[ANALYZER] Navigating to page: ${url}`);
-    await page.goto(url, {
-      waitUntil: "networkidle2",
-    });
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      // Give JS-rendered content up to 5s to settle
+      await page.waitForNetworkIdle({ timeout: 5000, idleTime: 500 }).catch(() => {});
+    } catch (navErr) {
+      // If navigation itself hard-fails (SSL error, DNS, etc.) rethrow so the
+      // outer catch can return a clean error to the user.
+      if (navErr.message.includes("net::") || navErr.message.includes("ERR_")) {
+        throw new Error(`Could not reach ${url}: ${navErr.message}`);
+      }
+      // Timeout just means the page was slow — content is likely loaded enough
+      console.log(`[ANALYZER] Navigation timeout (continuing anyway): ${navErr.message}`);
+    }
     console.log(`[ANALYZER] Page loaded successfully`);
 
     const loadTime = Date.now() - startTime;
@@ -49,7 +74,7 @@ export async function analyzeSEO(url) {
 
     // Take mobile screenshot
     console.log(`[ANALYZER] Taking mobile screenshot...`);
-    await page.setViewport({ width: 360, height: 640 }); // Compact mobile size
+    await page.setViewport({ width: 360, height: 640 });
     const screenshotMobile = await page.screenshot({
       encoding: "base64",
       fullPage: false,
@@ -57,18 +82,19 @@ export async function analyzeSEO(url) {
 
     // Get HTML content
     const html = await page.content();
-    
+
     // Calculate rendering percentage (text content vs HTML size)
     const $ = cheerio.load(html);
     const textContent = $("body").text().replace(/\s+/g, " ").trim();
     const htmlSize = html.length;
     const textSize = textContent.length;
-    const renderingPercentage = htmlSize > 0 
+    const renderingPercentage = htmlSize > 0
       ? Math.round((textSize / htmlSize) * 100)
       : 0;
 
-    // Close browser
+    // Close browser as soon as we have what we need — before the heavy Cheerio work
     await browser.close();
+    browser = null;
 
     // Parse with Cheerio (already loaded above)
 
@@ -1121,10 +1147,15 @@ export async function analyzeSEO(url) {
       stack: error.stack,
       name: error.name,
     });
-    if (browser) {
-      await browser.close();
-      console.log(`[ANALYZER] Browser closed after error`);
-    }
     throw error;
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+        console.log(`[ANALYZER] Browser closed in finally block`);
+      } catch (closeErr) {
+        console.error(`[ANALYZER] Error closing browser:`, closeErr.message);
+      }
+    }
   }
 }
