@@ -649,7 +649,10 @@ export async function analyzeSEO(url) {
       // Use the first address found
       if (addressCandidates.length > 0) {
         hasAddress = true;
-        addressText = addressCandidates[0].text.trim();
+        // Strip leading label words (e.g. "Location", "Address", "Our Location") that
+        // get pulled in when the scraped element contains a visible label alongside the value.
+        addressText = addressCandidates[0].text.trim()
+          .replace(/^(our\s+)?(location|address)\s*[:.\-–—]?\s*/i, '');
         addressSource = addressCandidates[0].source;
       }
     }
