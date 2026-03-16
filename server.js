@@ -102,8 +102,11 @@ class Semaphore {
   get active() { return this.count; }
 }
 
-const analysisSemaphore = new Semaphore(MAX_CONCURRENT_ANALYSES);
-const crawlSemaphore    = new Semaphore(Math.max(1, MAX_CONCURRENT_ANALYSES - 1));
+const analysisSemaphore  = new Semaphore(MAX_CONCURRENT_ANALYSES);
+const crawlSemaphore     = new Semaphore(Math.max(1, MAX_CONCURRENT_ANALYSES - 1));
+// Lighthouse uses global performance.mark() — concurrent runs corrupt each other's marks.
+// Use a mutex (max=1) to serialize all Lighthouse audits.
+const lighthouseSemaphore = new Semaphore(1);
 
 // DB pool for backlink storage
 const dbPool = new Pool({
@@ -378,6 +381,12 @@ app.post('/api/lighthouse', authenticateApiKey, async (req, res) => {
     return res.status(400).json({ error: 'A valid public http:// or https:// URL is required' });
   }
 
+  try {
+    await lighthouseSemaphore.acquire();
+  } catch (queueErr) {
+    return res.status(503).json({ success: false, error: queueErr.message });
+  }
+
   let chrome;
   try {
     console.log(`[LIGHTHOUSE] Starting audit for: ${url}`);
@@ -432,6 +441,7 @@ app.post('/api/lighthouse', authenticateApiKey, async (req, res) => {
     if (chrome) {
       try { await chrome.kill(); } catch (_) {}
     }
+    lighthouseSemaphore.release();
   }
 });
 
