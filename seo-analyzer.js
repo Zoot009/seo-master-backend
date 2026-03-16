@@ -456,17 +456,38 @@ export async function analyzeSEO(url) {
 
     let validPhone = null;
 
+    // Reject obviously fake/placeholder phone numbers (sequential digits, all same digit, etc.)
+    const isFakePhone = (num) => {
+      const digits = num.replace(/\D/g, '');
+      if (digits.length < 7) return true;
+      // All same digit: 0000000, 1111111
+      if (/^(\d)\1+$/.test(digits)) return true;
+      // Sequential ascending (wrapping): 1234567890, 234567890, 0123456789, etc.
+      let allAsc = true, allDesc = true;
+      for (let i = 1; i < digits.length; i++) {
+        if ((+digits[i] - +digits[i - 1] + 10) % 10 !== 1) allAsc = false;
+        if ((+digits[i - 1] - +digits[i] + 10) % 10 !== 1) allDesc = false;
+        if (!allAsc && !allDesc) break;
+      }
+      if (allAsc || allDesc) return true;
+      return false;
+    };
+
     // 1. tel: links — highest confidence: these are clickable and always reflect the real number
+    const telLinks = [];
     $('a[href^="tel:"]').each((_, el) => {
-      if (validPhone) return false;
       const displayText = $(el).text().trim();
       const hrefVal = ($(el).attr('href') || '').replace('tel:', '').trim();
-      // Prefer the visible display text (formatted); fall back to the href value
+      telLinks.push({ display: displayText, href: hrefVal });
+      if (validPhone) return false;
+      // Prefer visible display text (formatted); fall back to href value
       const candidate = displayText && /\d/.test(displayText) ? displayText : hrefVal;
-      if (candidate && /\d{7,}/.test(candidate.replace(/\D/g, ''))) {
+      if (candidate && /\d{7,}/.test(candidate.replace(/\D/g, '')) && !isFakePhone(candidate)) {
         validPhone = candidate;
       }
     });
+    console.log(`[PHONE-DEBUG] tel: links found (${telLinks.length}):`, JSON.stringify(telLinks));
+    console.log(`[PHONE-DEBUG] After tel: links → validPhone=${validPhone}`);
 
     // 2. Schema.org structured data (checked after tel: links — schema may be outdated/placeholder)
     if (!validPhone && ldJsonScripts.length > 0) {
@@ -484,10 +505,11 @@ export async function analyzeSEO(url) {
             return null;
           };
           const p = findPhone(schema);
-          if (p) validPhone = p;
+          if (p && !isFakePhone(p)) validPhone = p;
         } catch { /* skip */ }
       });
     }
+    console.log(`[PHONE-DEBUG] After schema → validPhone=${validPhone}`);
 
     // 3. Contact / footer elements
     if (!validPhone) {
@@ -501,14 +523,17 @@ export async function analyzeSEO(url) {
           if (validPhone) return false;
           const elText = $(el).text().replace(/\s+/g, ' ');
           const found = extractPhoneFromText(elText);
-          if (found) validPhone = found;
+          if (found && !isFakePhone(found)) { validPhone = found; console.log(`[PHONE-DEBUG] Found via contact selector "${sel}": ${found}`); }
         });
       }
     }
+    console.log(`[PHONE-DEBUG] After contact selectors → validPhone=${validPhone}`);
 
     // 4. Full bodyText — strict patterns only to avoid false positives
     if (!validPhone) {
-      validPhone = extractPhoneFromText(bodyText);
+      const candidate = extractPhoneFromText(bodyText);
+      if (candidate && !isFakePhone(candidate)) validPhone = candidate;
+      console.log(`[PHONE-DEBUG] After bodyText scan → validPhone=${validPhone}`);
     }
 
     if (validPhone) {
@@ -580,13 +605,17 @@ export async function analyzeSEO(url) {
       // Full street address (e.g. "123 Main Street, Albany, NY 12188")
       const usAddressRegex = /\b\d{1,5}\s+[A-Za-z][A-Za-z\s.]+?\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Way|Place|Pl|Plaza|Square|Trail|Parkway|Pkwy|Highway|Hwy)\b[,\s]*(?:[A-Za-z\s]+)?[,\s]*(?:[A-Z]{2})?\s*\d{5}?/gi;
       const usMatches = bodyText.match(usAddressRegex);
+      console.log(`[ADDRESS-DEBUG] US street regex matches:`, usMatches);
       if (usMatches) {
         usMatches.forEach(m => addressCandidates.push({ text: m, source: 'US address pattern' }));
       }
 
       // City, State ZIP format (e.g. "Waterford, NY 12188" or "Albany, NY 12201-1234")
-      const cityStateZipRegex = /\b[A-Za-z][A-Za-z\s]{1,30},\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\b/g;
+      // (?<![A-Za-z]) ensures we don't match a city name that is directly concatenated
+      // with a preceding word (e.g. "PlansContactWaterford" from class name + text fusion)
+      const cityStateZipRegex = /(?<![A-Za-z])[A-Za-z][A-Za-z\s]{1,30},\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\b/g;
       const cityStateMatches = bodyText.match(cityStateZipRegex);
+      console.log(`[ADDRESS-DEBUG] City/State/ZIP regex matches:`, cityStateMatches);
       if (cityStateMatches) {
         cityStateMatches.forEach(m => addressCandidates.push({ text: m.trim(), source: 'City/State/ZIP pattern' }));
       }
@@ -653,6 +682,7 @@ export async function analyzeSEO(url) {
       }
       
       // Use the first address found
+      console.log(`[ADDRESS-DEBUG] All candidates (${addressCandidates.length}):`, JSON.stringify(addressCandidates.slice(0, 10)));
       if (addressCandidates.length > 0) {
         hasAddress = true;
         // Strip leading label words (e.g. "Location", "Address", "Our Location") that
@@ -667,7 +697,9 @@ export async function analyzeSEO(url) {
     if (hasAddress && addressText) {
       console.log(`[ANALYZER] Address: "${addressText}" (Source: ${addressSource})`);
     } else {
-      console.log(`[ANALYZER] Address: Not found`);
+      // Log a snippet of bodyText around any digit to help diagnose why patterns failed
+      const snippet = bodyText.replace(/\s+/g, ' ').slice(0, 500);
+      console.log(`[ANALYZER] Address: Not found. bodyText snippet (first 500 chars): ${snippet}`);
     }
 
     // Performance
