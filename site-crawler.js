@@ -1,11 +1,11 @@
 /**
  * Site Crawler - Multi-page website audit
  *
- * Discovers every page on a website via sitemap + homepage link crawl,
- * then fast-crawls each one using axios + cheerio.
+ * Full recursive BFS crawler: seeds from sitemaps, then follows every internal
+ * link found on every crawled page — discovers all pages automatically.
  *
- * This is intentionally separate from seo-analyzer.js which does a deep
- * single-page Puppeteer analysis. This module trades depth for breadth.
+ * Proxy support: set PROXY_URL=http://user:pass@host:port in .env
+ * Proxy is only used as a fallback when direct requests are blocked (403/CF).
  */
 
 import axios from "axios";
@@ -14,19 +14,70 @@ import { parseStringPromise } from "xml2js";
 import puppeteer from "puppeteer";
 
 // ---------------------------------------------------------------------------
+// User-Agent rotation — reduces bot fingerprinting
+// ---------------------------------------------------------------------------
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+];
+function randomUA() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+// ---------------------------------------------------------------------------
+// Proxy support
+// ---------------------------------------------------------------------------
+function getProxyConfig() {
+  const raw = process.env.PROXY_URL;
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    const cfg = { protocol: u.protocol.replace(":", ""), host: u.hostname, port: parseInt(u.port, 10) };
+    if (u.username) cfg.auth = { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) };
+    return cfg;
+  } catch {
+    console.warn("[CRAWLER] Invalid PROXY_URL — proxy disabled");
+    return null;
+  }
+}
+
+function isBlocked(status, headers, body) {
+  if (![403, 503, 429].includes(status)) return false;
+  if (headers?.["cf-ray"] || headers?.server?.toLowerCase().includes("cloudflare")) return true;
+  if (typeof body === "string") {
+    const b = body.toLowerCase();
+    return b.includes("just a moment") || b.includes("checking your browser") ||
+           b.includes("ddos-guard") || b.includes("enable javascript") ||
+           b.includes("cf-browser-verification");
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
 function normalizeUrl(raw) {
-  if (!raw.startsWith("http://") && !raw.startsWith("https://")) {
-    return "https://" + raw;
-  }
+  if (!raw.startsWith("http://") && !raw.startsWith("https://")) return "https://" + raw;
   return raw;
 }
 
 function getDomain(url) {
   const u = new URL(url);
   return u.protocol + "//" + u.host;
+}
+
+/** Strip URL fragment and normalize for deduplication */
+function cleanUrl(url) {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    return u.href;
+  } catch {
+    return url;
+  }
 }
 
 /** Returns false for images, fonts, documents, scripts, stylesheets, etc. */
@@ -40,22 +91,17 @@ function isPageUrl(url) {
     ".ttf", ".woff", ".woff2", ".eot",
     ".js", ".css", ".xml", ".json", ".txt",
   ];
-
   const assetDirs = [
-    "/wp-content/", "/assets/", "/static/", "/images/",
-    "/img/", "/media/", "/files/", "/uploads/", "/css/", "/js/",
+    "/wp-content/uploads/", "/assets/", "/static/", "/images/",
+    "/img/", "/media/", "/files/", "/css/", "/js/",
   ];
-
-  const lower = url.toLowerCase();
-
+  const lower = url.toLowerCase().split("?")[0];
   for (const ext of assetExtensions) {
-    if (lower.endsWith(ext) || lower.includes(ext + "?")) return false;
+    if (lower.endsWith(ext)) return false;
   }
-
   for (const dir of assetDirs) {
     if (lower.includes(dir)) return false;
   }
-
   return true;
 }
 
@@ -65,17 +111,16 @@ function isSitemapEntry(url) {
 }
 
 // ---------------------------------------------------------------------------
-// URL Discovery
+// Sitemap discovery — seeds the BFS queue
 // ---------------------------------------------------------------------------
 
-/** Reads robots.txt and pulls out any Sitemap: directives */
 async function getSitemapsFromRobots(domain) {
   const sitemaps = [];
   try {
     console.log("[CRAWLER] Checking robots.txt...");
     const res = await axios.get(`${domain}/robots.txt`, {
       timeout: 10000,
-      headers: { "User-Agent": "Mozilla/5.0" },
+      headers: { "User-Agent": randomUA() },
     });
     for (const line of res.data.split("\n")) {
       if (line.toLowerCase().startsWith("sitemap:")) {
@@ -100,7 +145,7 @@ async function resolveSitemap(sitemapUrl, visited = new Set()) {
     console.log(`[CRAWLER]  → Fetching sitemap: ${sitemapUrl}`);
     const res = await axios.get(sitemapUrl, {
       timeout: 15000,
-      headers: { "User-Agent": "Mozilla/5.0" },
+      headers: { "User-Agent": randomUA() },
       responseType: "text",
     });
 
@@ -136,96 +181,90 @@ async function resolveSitemap(sitemapUrl, visited = new Set()) {
   return urls;
 }
 
-/** Scrapes internal links from the homepage */
-async function getHomepageLinks(domain) {
-  const urls = [];
-  try {
-    console.log("[CRAWLER] Crawling homepage for links...");
-    const res = await axios.get(domain, {
-      timeout: 15000,
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    const $ = cheerio.load(res.data);
-    $("a[href]").each((_, el) => {
-      const href = $(el).attr("href");
-      try {
-        const absolute = new URL(href, domain).href;
-        if (absolute.startsWith(domain) && isPageUrl(absolute)) {
-          urls.push(absolute);
-        }
-      } catch {}
-    });
-    console.log(`[CRAWLER] Found ${urls.length} links on homepage`);
-  } catch {
-    console.log("[CRAWLER] Could not crawl homepage for links");
-  }
-  return urls;
-}
-
-/**
- * Discovers all page URLs on the site.
- * Combines: robots.txt sitemaps + /sitemap.xml fallback + homepage links.
- */
-async function discoverUrls(baseUrl) {
+/** Collect seed URLs from all sitemaps — these prime the BFS queue */
+async function getSeedUrls(baseUrl) {
   const domain = getDomain(baseUrl);
-  const allUrls = new Set();
+  const seed = new Set();
 
-  // 1. Sitemaps from robots.txt
   const robotsSitemaps = await getSitemapsFromRobots(domain);
-
-  // 2. Always include the default sitemap location as a fallback
   if (!robotsSitemaps.some(s => s.includes("sitemap.xml"))) {
     robotsSitemaps.push(`${domain}/sitemap.xml`);
   }
 
-  // 3. Resolve all discovered sitemaps
   const visited = new Set();
   for (const sm of robotsSitemaps) {
     const urls = await resolveSitemap(sm, visited);
-    urls.filter(isPageUrl).forEach(u => allUrls.add(u));
+    urls
+      .filter(u => isPageUrl(u) && u.startsWith(domain))
+      .forEach(u => seed.add(cleanUrl(u)));
   }
 
-  // 4. Also grab homepage links (catches sites with no sitemap)
-  const homepageLinks = await getHomepageLinks(domain);
-  homepageLinks.forEach(u => allUrls.add(u));
+  // Always seed with homepage
+  seed.add(cleanUrl(domain + "/"));
+  seed.add(cleanUrl(baseUrl));
 
-  // Always include the homepage itself
-  allUrls.add(domain + "/");
-  allUrls.add(domain);
-
-  return Array.from(allUrls);
+  console.log(`[CRAWLER] Seeded ${seed.size} URLs from sitemaps`);
+  return [...seed];
 }
 
 // ---------------------------------------------------------------------------
-// Per-page analysis (axios + cheerio — no browser)
+// Per-page fetch with proxy fallback
 // ---------------------------------------------------------------------------
+async function fetchPage(url) {
+  const proxyConfig = getProxyConfig();
 
-function analyzePageHtml(html, url, status, loadTime, pageSizeKb) {
+  const attempt = async (useProxy) => {
+    const config = {
+      timeout: 12000,
+      headers: {
+        "User-Agent": randomUA(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+      },
+      validateStatus: () => true,
+      maxRedirects: 5,
+    };
+    if (useProxy && proxyConfig) config.proxy = proxyConfig;
+    const start = Date.now();
+    const response = await axios.get(url, config);
+    const loadTime = ((Date.now() - start) / 1000).toFixed(2);
+    const html = typeof response.data === "string" ? response.data : String(response.data);
+    return { response, loadTime, html };
+  };
+
+  try {
+    let result = await attempt(false);
+    // If blocked (CF/WAF), retry through proxy
+    if (proxyConfig && isBlocked(result.response.status, result.response.headers, result.html)) {
+      console.log(`[CRAWLER] Blocked at ${url} — retrying via proxy`);
+      try { result = await attempt(true); } catch {}
+    }
+    return result;
+  } catch (err) {
+    return { response: null, loadTime: 0, html: "", error: err };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-page analysis — returns page SEO data + discovered internal links
+// ---------------------------------------------------------------------------
+function analyzePageHtml(html, url, domain, status, loadTime, pageSizeKb) {
   const $ = cheerio.load(html);
 
-  // Title
   const title = $("title").first().text().trim() || null;
   const titleLength = title ? title.length : 0;
-
-  // Meta description
   const metaDescription = $('meta[name="description"]').attr("content")?.trim() || null;
   const metaLength = metaDescription ? metaDescription.length : 0;
-
-  // Canonical
   const canonical = $('link[rel="canonical"]').attr("href") || null;
-
-  // Robots meta
   const robotsMeta = $('meta[name="robots"]').attr("content")?.toLowerCase() || "";
   const isNoindex = robotsMeta.includes("noindex");
   const isNofollow = robotsMeta.includes("nofollow");
-
-  // Headings
   const h1Count = $("h1").length;
   const h2Count = $("h2").length;
   const h3Count = $("h3").length;
   const h1Text = $("h1").first().text().trim() || null;
 
-  // Images
   const images = $("img");
   let missingAlt = 0;
   images.each((_, img) => {
@@ -233,32 +272,31 @@ function analyzePageHtml(html, url, status, loadTime, pageSizeKb) {
     if (!alt || alt.trim().length === 0) missingAlt++;
   });
 
-  // Links
-  const urlObj = new URL(url);
   let internalLinks = 0;
   let externalLinks = 0;
+  const discoveredLinks = new Set();
   $("a[href]").each((_, el) => {
     const href = $(el).attr("href") || "";
-    if (href.startsWith("/") || href.includes(urlObj.hostname)) {
-      internalLinks++;
-    } else if (href.startsWith("http")) {
-      externalLinks++;
-    }
+    try {
+      const abs = new URL(href, url).href;
+      const clean = cleanUrl(abs);
+      if (clean.startsWith(domain)) {
+        internalLinks++;
+        // Follow links unless page declares nofollow
+        if (!isNofollow && isPageUrl(clean)) discoveredLinks.add(clean);
+      } else if (href.startsWith("http")) {
+        externalLinks++;
+      }
+    } catch {}
   });
 
-  // Word count
   const bodyText = $("body").text().replace(/\s+/g, " ").trim();
   const wordCount = bodyText.split(/\s+/).filter(w => w.length > 0).length;
-
-  // Open Graph
   const hasOgTitle = $('meta[property="og:title"]').length > 0;
   const hasOgDescription = $('meta[property="og:description"]').length > 0;
   const hasOgImage = $('meta[property="og:image"]').length > 0;
-
-  // Schema markup
   const hasSchema = $('script[type="application/ld+json"]').length > 0;
 
-  // Classify HTTP status
   function classifyStatus(s) {
     if (s >= 200 && s < 300) return "ok";
     if (s >= 300 && s < 400) return "redirect";
@@ -271,16 +309,13 @@ function analyzePageHtml(html, url, status, loadTime, pageSizeKb) {
     return "error";
   }
 
-  // Issues detected for this page
   const issues = [];
   if (!title) issues.push("missing_title");
   else if (titleLength < 30) issues.push("title_too_short");
   else if (titleLength > 60) issues.push("title_too_long");
-
   if (!metaDescription) issues.push("missing_meta_description");
   else if (metaLength < 70) issues.push("meta_description_too_short");
   else if (metaLength > 160) issues.push("meta_description_too_long");
-
   if (h1Count === 0) issues.push("missing_h1");
   if (h1Count > 1) issues.push("multiple_h1");
   if (missingAlt > 0) issues.push("images_missing_alt");
@@ -289,100 +324,41 @@ function analyzePageHtml(html, url, status, loadTime, pageSizeKb) {
   if (wordCount < 300) issues.push("thin_content");
 
   return {
-    url,
-    status,
-    statusClass: classifyStatus(status),
-    loadTime: Number(loadTime),
-    pageSizeKb: Number(pageSizeKb),
-    title,
-    titleLength,
-    metaDescription,
-    metaLength,
-    canonical,
-    isNoindex,
-    isNofollow,
-    h1Count,
-    h2Count,
-    h3Count,
-    h1Text,
-    wordCount,
-    totalImages: images.length,
-    missingAlt,
-    internalLinks,
-    externalLinks,
-    hasOgTitle,
-    hasOgDescription,
-    hasOgImage,
-    hasSchema,
-    issues,
+    page: {
+      url, status, statusClass: classifyStatus(status),
+      loadTime: Number(loadTime), pageSizeKb: Number(pageSizeKb),
+      title, titleLength, metaDescription, metaLength, canonical,
+      isNoindex, isNofollow, h1Count, h2Count, h3Count, h1Text,
+      wordCount, totalImages: images.length, missingAlt,
+      internalLinks, externalLinks,
+      hasOgTitle, hasOgDescription, hasOgImage, hasSchema, issues,
+    },
+    links: [...discoveredLinks],
   };
 }
 
-// ---------------------------------------------------------------------------
-// Fast HTTP crawler (axios-based, no browser)
-// ---------------------------------------------------------------------------
+/** Fetch + analyze a single page, returns { page, links } */
+async function crawlPage(url, domain) {
+  const { response, loadTime, html, error } = await fetchPage(url);
 
-async function crawlPage(url) {
-  try {
-    const start = Date.now();
-    const response = await axios.get(url, {
-      timeout: 10000,
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; SEOMasterBot/1.0)" },
-      validateStatus: () => true, // don't throw on 4xx/5xx
-      maxRedirects: 5,
-    });
-
-    const loadTime = ((Date.now() - start) / 1000).toFixed(2);
-    const html = typeof response.data === "string" ? response.data : String(response.data);
-    const pageSizeKb = (Buffer.byteLength(html) / 1024).toFixed(1);
-
-    return analyzePageHtml(html, url, response.status, loadTime, pageSizeKb);
-  } catch (err) {
-    const isTimeout = err.code === "ECONNABORTED" || err.code === "ETIMEDOUT";
+  if (error || !response) {
+    const isTimeout = error?.code === "ECONNABORTED" || error?.code === "ETIMEDOUT";
     return {
-      url,
-      status: isTimeout ? 408 : 0,
-      statusClass: isTimeout ? "timeout" : "error",
-      loadTime: isTimeout ? 10 : 0,
-      pageSizeKb: 0,
-      title: null,
-      titleLength: 0,
-      metaDescription: null,
-      metaLength: 0,
-      canonical: null,
-      isNoindex: false,
-      isNofollow: false,
-      h1Count: 0,
-      h2Count: 0,
-      h3Count: 0,
-      h1Text: null,
-      wordCount: 0,
-      totalImages: 0,
-      missingAlt: 0,
-      internalLinks: 0,
-      externalLinks: 0,
-      hasOgTitle: false,
-      hasOgDescription: false,
-      hasOgImage: false,
-      hasSchema: false,
-      issues: ["crawl_error"],
-      error: err.message?.slice(0, 120) || "Unknown error",
+      page: {
+        url, status: isTimeout ? 408 : 0, statusClass: isTimeout ? "timeout" : "error",
+        loadTime: isTimeout ? 12 : 0, pageSizeKb: 0, title: null, titleLength: 0,
+        metaDescription: null, metaLength: 0, canonical: null, isNoindex: false,
+        isNofollow: false, h1Count: 0, h2Count: 0, h3Count: 0, h1Text: null,
+        wordCount: 0, totalImages: 0, missingAlt: 0, internalLinks: 0, externalLinks: 0,
+        hasOgTitle: false, hasOgDescription: false, hasOgImage: false, hasSchema: false,
+        issues: ["crawl_error"], error: error?.message?.slice(0, 120) || "Unknown error",
+      },
+      links: [],
     };
   }
-}
 
-/** Simple batch-concurrency runner — processes `maxConcurrent` pages at once */
-async function crawlBatch(urls, maxConcurrent = 10, onProgress = null) {
-  const results = [];
-  for (let i = 0; i < urls.length; i += maxConcurrent) {
-    const batch = urls.slice(i, i + maxConcurrent);
-    const batchResults = await Promise.all(batch.map(url => crawlPage(url)));
-    results.push(...batchResults);
-    if (onProgress) {
-      onProgress(Math.min(i + maxConcurrent, urls.length), urls.length);
-    }
-  }
-  return results;
+  const pageSizeKb = (Buffer.byteLength(html) / 1024).toFixed(1);
+  return analyzePageHtml(html, url, domain, response.status, loadTime, pageSizeKb);
 }
 
 // ---------------------------------------------------------------------------
@@ -442,15 +418,9 @@ function buildSummary(results) {
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * crawlSite(baseUrl, options) — Main exported function
- *
- * @param {string} baseUrl  - Full URL of the website to audit
- * @param {object} options
- *   @param {number} [options.concurrency=10]     - Parallel requests
- *   @param {function} [options.onProgress]       - (done, total) callback
- * @returns {{ pages, summary, discoveredUrls, crawledAt }}
- */
+// ---------------------------------------------------------------------------
+// Screenshots
+// ---------------------------------------------------------------------------
 async function takeHomepageScreenshots(url) {
   let browser;
   try {
@@ -476,43 +446,80 @@ async function takeHomepageScreenshots(url) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Main export — BFS recursive crawler
+// ---------------------------------------------------------------------------
+
+/**
+ * crawlSite(baseUrl, options)
+ *
+ * Seeds from sitemaps, then follows every internal link found on every crawled
+ * page (BFS). Discovers all pages automatically regardless of sitemap coverage.
+ *
+ * @param {string} baseUrl
+ * @param {object} options
+ *   @param {number} [options.concurrency=15]  Parallel workers
+ *   @param {number} [options.maxPages=2000]   Hard cap — prevents runaway on huge sites
+ *   @param {function} [options.onProgress]    (crawled, total) callback
+ */
 export async function crawlSite(baseUrl, options = {}) {
   const {
-    concurrency = 10,
+    concurrency = 15,
+    maxPages = 2000,
     onProgress = null,
   } = options;
 
   baseUrl = normalizeUrl(baseUrl);
-  console.log(`[CRAWLER] Starting site crawl: ${baseUrl}`);
+  const domain = getDomain(baseUrl);
+  console.log(`[CRAWLER] Starting BFS crawl: ${baseUrl} (concurrency=${concurrency}, maxPages=${maxPages})`);
 
-  // Step 0: Take homepage screenshot
+  // Step 0: Homepage screenshot
   console.log("[CRAWLER] Taking homepage screenshot...");
   const { screenshot, screenshotMobile } = await takeHomepageScreenshots(baseUrl);
 
-  // Step 1: Discover URLs
-  console.log("[CRAWLER] Discovering URLs...");
-  const allDiscovered = await discoverUrls(baseUrl);
-  console.log(`[CRAWLER] Discovered ${allDiscovered.length} URLs`);
+  // Step 1: Seed queue from sitemaps
+  const seedUrls = await getSeedUrls(baseUrl);
 
-  // Step 2: Deduplicate
-  const uniqueUrls = [...new Set(allDiscovered)];
-  console.log(`[CRAWLER] Crawling ${uniqueUrls.length} pages`);
+  // BFS state — shared mutable queue (JS is single-threaded; shift() is atomic)
+  const queue = [...seedUrls];
+  const seen  = new Set(queue);   // all URLs ever enqueued (prevents duplicates)
+  const results = [];             // completed page analyses
 
-  // Step 3: Crawl all pages
-  const pages = await crawlBatch(uniqueUrls, concurrency, (done, total) => {
-    console.log(`[CRAWLER] Progress: ${done}/${total}`);
-    if (onProgress) onProgress(done, total);
-  });
+  console.log(`[CRAWLER] BFS starting with ${queue.length} seed URLs...`);
 
-  // Step 4: Build summary
-  const summary = buildSummary(pages);
+  // Step 2: N workers drain the queue; new links found are pushed to the back
+  const worker = async () => {
+    while (true) {
+      if (results.length >= maxPages) break;
+      const url = queue.shift();
+      if (url === undefined) break; // queue drained
 
-  console.log(`[CRAWLER] Done. ${pages.length} pages crawled.`);
+      const { page, links } = await crawlPage(url, domain);
+      results.push(page);
+
+      // Enqueue newly discovered internal links
+      for (const link of links) {
+        if (!seen.has(link) && results.length + queue.length < maxPages) {
+          seen.add(link);
+          queue.push(link);
+        }
+      }
+
+      const total = results.length + queue.length;
+      console.log(`[CRAWLER] Progress: ${results.length}/${total}`);
+      if (onProgress) onProgress(results.length, total);
+    }
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  const summary = buildSummary(results);
+  console.log(`[CRAWLER] Done. ${results.length} pages crawled, ${seen.size} total discovered.`);
 
   return {
-    pages,
+    pages: results,
     summary,
-    discoveredUrls: allDiscovered.length,
+    discoveredUrls: seen.size,
     crawledAt: new Date().toISOString(),
     screenshot,
     screenshotMobile,

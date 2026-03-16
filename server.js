@@ -324,7 +324,7 @@ app.post('/api/generate-pdf', authenticateApiKey, async (req, res) => {
 // Site Crawl endpoint — discovers and audits every page on a website
 app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
   const url = validateHttpUrl(req.body.url);
-  const { concurrency } = req.body;
+  const { concurrency, maxPages } = req.body;
 
   if (!url) {
     return res.status(400).json({ error: 'A valid public http:// or https:// URL is required' });
@@ -338,7 +338,7 @@ app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
     return res.status(503).json({ success: false, error: queueErr.message });
   }
 
-  const CRAWL_TIMEOUT_MS = parseInt(process.env.CRAWL_TIMEOUT_MS || "300000", 10); // 5 min
+  const CRAWL_TIMEOUT_MS = parseInt(process.env.CRAWL_TIMEOUT_MS || "900000", 10); // 15 min
 
   let released = false;
   const release = () => { if (!released) { released = true; crawlSemaphore.release(); } };
@@ -352,7 +352,8 @@ app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
 
   try {
     const options = {
-      concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : 10,
+      concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : 15,
+      maxPages: typeof maxPages === 'number' && maxPages > 0 ? Math.min(maxPages, 5000) : 2000,
     };
 
     console.log(`[BACKEND] Starting site crawl for: ${url}`);
