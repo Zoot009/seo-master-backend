@@ -18,6 +18,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import puppeteer from 'puppeteer';
 import axios from 'axios';
@@ -35,6 +36,30 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 const API_KEY = process.env.API_KEY;
+
+// ---------------------------------------------------------------------------
+// URL sanitizer — ensures only valid public http(s) URLs reach Puppeteer/Axios.
+// Blocks private / loopback addresses to prevent SSRF.
+// ---------------------------------------------------------------------------
+function validateHttpUrl(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  let parsed;
+  try { parsed = new URL(raw); } catch { return null; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  const host = parsed.hostname.toLowerCase();
+  // Block loopback, link-local, and private RFC-1918 ranges
+  if (
+    host === 'localhost' ||
+    /^127\./.test(host) ||
+    /^0\./.test(host) ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    host === '::1' ||
+    host === '0.0.0.0'
+  ) return null;
+  return parsed.href;
+}
 
 // ---------------------------------------------------------------------------
 // Concurrency limiter — prevents the server from spawning too many Chrome
@@ -109,6 +134,30 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
+// ---------------------------------------------------------------------------
+// Rate limiting
+// General: 60 req/min per IP on all /api/* routes.
+// Heavy:   10 req/min on CPU/browser-intensive endpoints.
+// ---------------------------------------------------------------------------
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests — please try again in a minute.' },
+});
+const heavyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests for this endpoint — please slow down.' },
+});
+app.use('/api/', generalLimiter);
+['/api/analyze', '/api/crawl-site', '/api/lighthouse', '/api/crawl-backlinks', '/api/generate-pdf'].forEach(
+  (path) => app.use(path, heavyLimiter)
+);
+
 // API Key authentication middleware
 const authenticateApiKey = (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
@@ -135,10 +184,11 @@ app.get('/health', (req, res) => {
 
 // SEO Analysis endpoint (auth required)
 app.post('/api/analyze', authenticateApiKey, async (req, res) => {
-  const { url, reportId } = req.body;
+  const { url: rawUrl, reportId } = req.body;
+  const url = validateHttpUrl(rawUrl);
 
-  if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'URL is required and must be a string' });
+  if (!url) {
+    return res.status(400).json({ error: 'A valid public http:// or https:// URL is required' });
   }
 
   console.log(`[BACKEND] Queuing SEO analysis for: ${url} (active=${analysisSemaphore.active}, queued=${analysisSemaphore.queued})`);
@@ -194,11 +244,10 @@ app.post('/api/analyze', authenticateApiKey, async (req, res) => {
 // Schema Markup Validation endpoint (auth required)
 app.post('/api/validate-schema', authenticateApiKey, async (req, res) => {
   try {
-    const { url } = req.body;
+    const url = validateHttpUrl(req.body.url);
 
-    // Validate URL
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({ error: 'URL is required and must be a string' });
+    if (!url) {
+      return res.status(400).json({ error: 'A valid public http:// or https:// URL is required' });
     }
 
     console.log(`[BACKEND] Starting schema validation for: ${url}`);
@@ -271,10 +320,11 @@ app.post('/api/generate-pdf', authenticateApiKey, async (req, res) => {
 
 // Site Crawl endpoint — discovers and audits every page on a website
 app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
-  const { url, concurrency } = req.body;
+  const url = validateHttpUrl(req.body.url);
+  const { concurrency } = req.body;
 
-  if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'url is required and must be a string' });
+  if (!url) {
+    return res.status(400).json({ error: 'A valid public http:// or https:// URL is required' });
   }
 
   console.log(`[BACKEND] Queuing site crawl for: ${url} (active=${crawlSemaphore.active}, queued=${crawlSemaphore.queued})`);
@@ -323,9 +373,9 @@ app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
 
 // Lighthouse Performance endpoint — runs real Lighthouse audit on any URL
 app.post('/api/lighthouse', authenticateApiKey, async (req, res) => {
-  const { url } = req.body;
-  if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'url is required' });
+  const url = validateHttpUrl(req.body.url);
+  if (!url) {
+    return res.status(400).json({ error: 'A valid public http:// or https:// URL is required' });
   }
 
   let chrome;
@@ -387,26 +437,21 @@ app.post('/api/lighthouse', authenticateApiKey, async (req, res) => {
 
 // Backlink Crawler endpoint — crawls a site and discovers all internal + external links
 app.post('/api/crawl-backlinks', authenticateApiKey, async (req, res) => {
-  const { url, maxPages = 40, maxDepth = 2 } = req.body;
+  const safeUrl = validateHttpUrl(req.body.url);
+  // Clamp maxPages (1–200) and maxDepth (1–10) to prevent resource abuse
+  const maxPages = Math.min(Math.max(1, parseInt(req.body.maxPages, 10) || 40), 200);
+  const maxDepth = Math.min(Math.max(1, parseInt(req.body.maxDepth, 10) || 2), 10);
 
-  if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'url is required' });
+  if (!safeUrl) {
+    return res.status(400).json({ error: 'A valid public http:// or https:// URL is required' });
   }
 
-  let startUrl;
-  try {
-    startUrl = new URL(url.startsWith('http') ? url : 'https://' + url);
-  } catch {
-    return res.status(400).json({ error: 'Invalid URL provided' });
-  }
-
+  const startUrl = new URL(safeUrl);
   const baseDomain = startUrl.hostname;
-  console.log(`[BACKLINK] Starting crawl for: ${baseDomain} (max ${maxPages} pages)`);
+  console.log(`[BACKLINK] Starting crawl for: ${baseDomain} (max ${maxPages} pages, maxDepth ${maxDepth})`);
 
   try {
-    // Clear old data for this domain so results are always fresh
-    await dbPool.query('DELETE FROM backlinks WHERE target_domain = $1', [baseDomain]);
-
+    // History is preserved — ON CONFLICT DO NOTHING avoids duplicates without wiping prior crawls
     const visited = new Set();
     const queue = [startUrl.href];
     const allLinks = [];
@@ -504,8 +549,30 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`SEO Analyzer Backend running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`CORS allowed origins: ${allowedOrigins.join(', ')}`);
 });
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown — on SIGTERM/SIGINT, stop accepting new connections, wait
+// for in-flight requests to finish (or force-exit after grace period), then
+// close the DB pool so Postgres connections are released cleanly.
+// ---------------------------------------------------------------------------
+async function shutdown(signal) {
+  console.log(`[SHUTDOWN] Received ${signal}, shutting down gracefully…`);
+  server.close(() => console.log('[SHUTDOWN] HTTP server closed.'));
+  try {
+    await dbPool.end();
+    console.log('[SHUTDOWN] DB pool closed.');
+  } catch (_) {}
+  const graceMs = parseInt(process.env.SHUTDOWN_GRACE_MS || '10000', 10);
+  setTimeout(() => {
+    console.log('[SHUTDOWN] Force exit after grace period.');
+    process.exit(0);
+  }, graceMs).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
