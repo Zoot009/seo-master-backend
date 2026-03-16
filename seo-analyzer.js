@@ -456,7 +456,19 @@ export async function analyzeSEO(url) {
 
     let validPhone = null;
 
-    // 1. Schema.org
+    // 1. tel: links — highest confidence: these are clickable and always reflect the real number
+    $('a[href^="tel:"]').each((_, el) => {
+      if (validPhone) return false;
+      const displayText = $(el).text().trim();
+      const hrefVal = ($(el).attr('href') || '').replace('tel:', '').trim();
+      // Prefer the visible display text (formatted); fall back to the href value
+      const candidate = displayText && /\d/.test(displayText) ? displayText : hrefVal;
+      if (candidate && /\d{7,}/.test(candidate.replace(/\D/g, ''))) {
+        validPhone = candidate;
+      }
+    });
+
+    // 2. Schema.org structured data (checked after tel: links — schema may be outdated/placeholder)
     if (!validPhone && ldJsonScripts.length > 0) {
       ldJsonScripts.each((_, el) => {
         if (validPhone) return false;
@@ -474,19 +486,6 @@ export async function analyzeSEO(url) {
           const p = findPhone(schema);
           if (p) validPhone = p;
         } catch { /* skip */ }
-      });
-    }
-
-    // 2. tel: links — most reliable HTML signal
-    if (!validPhone) {
-      $('a[href^="tel:"]').each((_, el) => {
-        if (validPhone) return false;
-        const displayText = $(el).text().trim();
-        const hrefVal = ($(el).attr('href') || '').replace('tel:', '').trim();
-        const candidate = displayText && /\d/.test(displayText) ? displayText : hrefVal;
-        if (candidate && /\d{7,}/.test(candidate.replace(/\D/g, ''))) {
-          validPhone = candidate;
-        }
       });
     }
 
@@ -578,11 +577,18 @@ export async function analyzeSEO(url) {
     if (!hasAddress) {
       let addressCandidates = [];
       
-      // Look for addresses with street numbers and street types (US format)
+      // Full street address (e.g. "123 Main Street, Albany, NY 12188")
       const usAddressRegex = /\b\d{1,5}\s+[A-Za-z][A-Za-z\s.]+?\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Way|Place|Pl|Plaza|Square|Trail|Parkway|Pkwy|Highway|Hwy)\b[,\s]*(?:[A-Za-z\s]+)?[,\s]*(?:[A-Z]{2})?\s*\d{5}?/gi;
       const usMatches = bodyText.match(usAddressRegex);
       if (usMatches) {
         usMatches.forEach(m => addressCandidates.push({ text: m, source: 'US address pattern' }));
+      }
+
+      // City, State ZIP format (e.g. "Waterford, NY 12188" or "Albany, NY 12201-1234")
+      const cityStateZipRegex = /\b[A-Za-z][A-Za-z\s]{1,30},\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\b/g;
+      const cityStateMatches = bodyText.match(cityStateZipRegex);
+      if (cityStateMatches) {
+        cityStateMatches.forEach(m => addressCandidates.push({ text: m.trim(), source: 'City/State/ZIP pattern' }));
       }
       
       // Look for PO Box addresses
