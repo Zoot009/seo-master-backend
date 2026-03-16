@@ -12,6 +12,10 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import { parseStringPromise } from "xml2js";
 import puppeteer from "puppeteer";
+import puppeteerExtra from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+
+puppeteerExtra.use(StealthPlugin());
 
 // ---------------------------------------------------------------------------
 // User-Agent rotation — reduces bot fingerprinting
@@ -45,15 +49,106 @@ function getProxyConfig() {
 }
 
 function isBlocked(status, headers, body) {
-  if (![403, 503, 429].includes(status)) return false;
-  if (headers?.["cf-ray"] || headers?.server?.toLowerCase().includes("cloudflare")) return true;
+  // Status-independent CF check — catches JS challenges that return 200
   if (typeof body === "string") {
     const b = body.toLowerCase();
-    return b.includes("just a moment") || b.includes("checking your browser") ||
-           b.includes("ddos-guard") || b.includes("enable javascript") ||
-           b.includes("cf-browser-verification");
+    if (
+      b.includes("just a moment") ||
+      b.includes("checking your browser") ||
+      b.includes("cf-browser-verification") ||
+      b.includes("performing security verification") ||
+      b.includes("ddos-guard") ||
+      (b.includes("enable javascript") && b.includes("cloudflare"))
+    ) return true;
   }
+  if (![403, 503, 429].includes(status)) return false;
+  if (headers?.["cf-ray"] || headers?.server?.toLowerCase().includes("cloudflare")) return true;
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Stealth browser pool — shared across all pages in one crawl
+// Launched lazily only when Cloudflare blocks axios + proxy
+// ---------------------------------------------------------------------------
+class StealthBrowserPool {
+  constructor(concurrency, proxyConfig) {
+    this.concurrency = concurrency;
+    this.proxyConfig = proxyConfig;
+    this.browser = null;
+    this.available = [];  // idle Page objects
+    this.pending = [];    // queued resolve callbacks waiting for a page
+    this.total = 0;
+  }
+
+  async launch() {
+    if (this.browser) return;
+    const args = [
+      "--no-sandbox", "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage", "--disable-gpu",
+    ];
+    if (this.proxyConfig) {
+      args.push(`--proxy-server=${this.proxyConfig.protocol}://${this.proxyConfig.host}:${this.proxyConfig.port}`);
+    }
+    this.browser = await puppeteerExtra.launch({ headless: true, args });
+    console.log("[CRAWLER] Stealth browser launched for Cloudflare bypass");
+    // Pre-warm a pool of tabs
+    for (let i = 0; i < this.concurrency; i++) {
+      const page = await this.browser.newPage();
+      if (this.proxyConfig?.auth) {
+        await page.authenticate({ username: this.proxyConfig.auth.username, password: this.proxyConfig.auth.password });
+      }
+      await page.setUserAgent(randomUA());
+      await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+      this.available.push(page);
+    }
+    this.total = this.concurrency;
+  }
+
+  acquire() {
+    return new Promise((resolve) => {
+      if (this.available.length > 0) {
+        resolve(this.available.pop());
+      } else {
+        this.pending.push(resolve);
+      }
+    });
+  }
+
+  release(page) {
+    if (this.pending.length > 0) {
+      const next = this.pending.shift();
+      next(page);
+    } else {
+      this.available.push(page);
+    }
+  }
+
+  async close() {
+    if (this.browser) {
+      await this.browser.close().catch(() => {});
+      this.browser = null;
+    }
+  }
+}
+
+/** Fetch a single URL using the stealth browser pool */
+async function fetchPageStealth(url, pool) {
+  const page = await pool.acquire();
+  try {
+    const start = Date.now();
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+    // Wait a moment for CF challenge to resolve
+    await new Promise(r => setTimeout(r, 1500));
+    const html = await page.content();
+    const loadTime = ((Date.now() - start) / 1000).toFixed(2);
+    const status = response?.status() ?? 200;
+    const headers = response?.headers() ?? {};
+    pool.release(page);
+    return { response: { status, headers }, loadTime, html };
+  } catch (err) {
+    pool.release(page);
+    return { response: null, loadTime: 0, html: "", error: err };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,10 +331,12 @@ async function fetchPage(url) {
   try {
     let result = await attempt(false);
     // If blocked (CF/WAF), retry through proxy
-    if (proxyConfig && isBlocked(result.response.status, result.response.headers, result.html)) {
+    if (proxyConfig && isBlocked(result.response?.status, result.response?.headers, result.html)) {
       console.log(`[CRAWLER] Blocked at ${url} — retrying via proxy`);
       try { result = await attempt(true); } catch {}
     }
+    // If still blocked even via proxy, stealth browser pool will handle it
+    // (handled in crawlPage — pool passed as argument)
     return result;
   } catch (err) {
     return { response: null, loadTime: 0, html: "", error: err };
@@ -338,8 +435,21 @@ function analyzePageHtml(html, url, domain, status, loadTime, pageSizeKb) {
 }
 
 /** Fetch + analyze a single page, returns { page, links } */
-async function crawlPage(url, domain) {
-  const { response, loadTime, html, error } = await fetchPage(url);
+async function crawlPage(url, domain, stealthPool = null) {
+  let { response, loadTime, html, error } = await fetchPage(url);
+
+  // If axios (direct + proxy) both returned a CF block, try stealth browser
+  if (stealthPool && (!error) && response && isBlocked(response.status, response.headers, html)) {
+    console.log(`[CRAWLER] CF block persists — using stealth browser for ${url}`);
+    await stealthPool.launch();
+    const stealthResult = await fetchPageStealth(url, stealthPool);
+    if (!stealthResult.error && stealthResult.html) {
+      response = stealthResult.response;
+      loadTime = stealthResult.loadTime;
+      html = stealthResult.html;
+      error = null;
+    }
+  }
 
   if (error || !response) {
     const isTimeout = error?.code === "ECONNABORTED" || error?.code === "ETIMEDOUT";
@@ -473,6 +583,9 @@ export async function crawlSite(baseUrl, options = {}) {
   const domain = getDomain(baseUrl);
   console.log(`[CRAWLER] Starting BFS crawl: ${baseUrl} (concurrency=${concurrency}, maxPages=${maxPages})`);
 
+  // Stealth pool — launched lazily only if CF blocks axios + proxy
+  const stealthPool = new StealthBrowserPool(Math.min(concurrency, 5), getProxyConfig());
+
   // Step 0: Homepage screenshot
   console.log("[CRAWLER] Taking homepage screenshot...");
   const { screenshot, screenshotMobile } = await takeHomepageScreenshots(baseUrl);
@@ -494,7 +607,7 @@ export async function crawlSite(baseUrl, options = {}) {
       const url = queue.shift();
       if (url === undefined) break; // queue drained
 
-      const { page, links } = await crawlPage(url, domain);
+      const { page, links } = await crawlPage(url, domain, stealthPool);
       results.push(page);
 
       // Enqueue newly discovered internal links
@@ -512,6 +625,9 @@ export async function crawlSite(baseUrl, options = {}) {
   };
 
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  // Clean up stealth browser if it was used
+  await stealthPool.close();
 
   const summary = buildSummary(results);
   console.log(`[CRAWLER] Done. ${results.length} pages crawled, ${seen.size} total discovered.`);
