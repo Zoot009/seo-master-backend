@@ -49,20 +49,28 @@ function getProxyConfig() {
 }
 
 function isBlocked(status, headers, body) {
-  // Status-independent CF check — catches JS challenges that return 200
-  if (typeof body === "string") {
-    const b = body.toLowerCase();
-    if (
-      b.includes("just a moment") ||
-      b.includes("checking your browser") ||
-      b.includes("cf-browser-verification") ||
-      b.includes("performing security verification") ||
-      b.includes("ddos-guard") ||
-      (b.includes("enable javascript") && b.includes("cloudflare"))
-    ) return true;
+  const b = typeof body === "string" ? body.toLowerCase() : "";
+
+  // Cloudflare JS challenge — can return 200, 403, or 503
+  if (
+    b.includes("just a moment") ||
+    b.includes("checking your browser") ||
+    b.includes("cf-browser-verification") ||
+    b.includes("performing security verification") ||
+    b.includes("_cf_chl") ||
+    b.includes("cf.challenge") ||
+    b.includes("ddos-guard") ||
+    b.includes("ray id") ||
+    (b.includes("enable javascript") && b.includes("cloudflare")) ||
+    // Cloudflare returns tiny body when challenging
+    (b.length < 2000 && (headers?.["cf-ray"] || headers?.server?.toLowerCase()?.includes("cloudflare")))
+  ) return true;
+
+  // Standard block status codes with CF headers
+  if ([403, 503, 429].includes(status)) {
+    if (headers?.["cf-ray"] || headers?.server?.toLowerCase()?.includes("cloudflare")) return true;
   }
-  if (![403, 503, 429].includes(status)) return false;
-  if (headers?.["cf-ray"] || headers?.server?.toLowerCase().includes("cloudflare")) return true;
+
   return false;
 }
 
@@ -136,15 +144,25 @@ async function fetchPageStealth(url, pool) {
   const page = await pool.acquire();
   try {
     const start = Date.now();
-    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
-    // Wait a moment for CF challenge to resolve
-    await new Promise(r => setTimeout(r, 1500));
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+    // Check if CF challenge is still showing.
+    // If page.evaluate throws "Execution context destroyed", CF already redirected
+    // us to the real page — no extra wait needed.
+    const isCFChallenge = await page.evaluate(() => {
+      const t = document.body?.innerText?.slice(0, 300)?.toLowerCase() ?? "";
+      return t.includes("just a moment") || t.includes("checking your browser") || t.includes("security verification");
+    }).catch(() => false);
+
+    if (isCFChallenge) {
+      // CF JS challenge is still running — wait for it to redirect to the real page
+      await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 8000 }).catch(() => {});
+    }
+
     const html = await page.content();
     const loadTime = ((Date.now() - start) / 1000).toFixed(2);
-    const status = response?.status() ?? 200;
-    const headers = response?.headers() ?? {};
     pool.release(page);
-    return { response: { status, headers }, loadTime, html };
+    return { response: { status: 200, headers: {} }, loadTime, html };
   } catch (err) {
     pool.release(page);
     return { response: null, loadTime: 0, html: "", error: err };
@@ -205,19 +223,78 @@ function isSitemapEntry(url) {
   return lower.includes("sitemap") || lower.endsWith(".xml") || lower.endsWith(".xml.gz");
 }
 
+/**
+ * Returns true if the URL belongs to the same site as domain.
+ * Treats www.example.com and example.com as the same site.
+ */
+function isSameSite(url, domain) {
+  if (url.startsWith(domain)) return true;
+  const altDomain = domain.includes("://www.")
+    ? domain.replace("://www.", "://")
+    : domain.replace("://", "://www.");
+  return url.startsWith(altDomain);
+}
+
 // ---------------------------------------------------------------------------
 // Sitemap discovery — seeds the BFS queue
 // ---------------------------------------------------------------------------
+
+/**
+ * Fetch raw text content (robots.txt, XML sitemaps).
+ * Always tries a direct request first — fast and free.
+ * Falls back to Scrape.do only when the direct attempt fails or returns
+ * a blocked/empty response, so CF-protected sitemaps still work.
+ */
+async function fetchTextContent(url) {
+  // --- 1. Direct fetch (no proxy, no cost) ---
+  try {
+    const res = await axios.get(url, {
+      timeout: 15000,
+      headers: {
+        "User-Agent": randomUA(),
+        "Accept": "text/xml,application/xml,text/html,*/*;q=0.8",
+      },
+      responseType: "text",
+      validateStatus: () => true,
+    });
+    const text = typeof res.data === "string" ? res.data : String(res.data);
+    // Accept if status is 2xx/3xx AND body is non-empty and looks like text content
+    if (res.status < 400 && text.trim().length > 64) {
+      console.log(`[CRAWLER]    direct fetch OK for ${url} (${res.status}, ${text.length} bytes)`);
+      return text;
+    }
+    console.log(`[CRAWLER]    direct fetch got ${res.status} or empty body for ${url} — trying Scrape.do`);
+  } catch (directErr) {
+    console.log(`[CRAWLER]    direct fetch failed for ${url} (${directErr.message}) — trying Scrape.do`);
+  }
+
+  // --- 2. Scrape.do fallback (handles Cloudflare / WAF protection) ---
+  if (process.env.SCRAPE_DO_TOKEN) {
+    const token = process.env.SCRAPE_DO_TOKEN;
+    const apiUrl = `https://api.scrape.do/?token=${token}&url=${encodeURIComponent(url)}&render=false`;
+    const res = await axios.get(apiUrl, {
+      timeout: 30000,
+      validateStatus: () => true,
+      headers: { "Accept": "text/xml,application/xml,text/html,*/*;q=0.8" },
+    });
+    // Scrape.do sometimes returns a JSON error object — surface it clearly
+    if (typeof res.data === "object" && res.data !== null) {
+      throw new Error(`Scrape.do returned JSON error: ${JSON.stringify(res.data).slice(0, 200)}`);
+    }
+    const text = typeof res.data === "string" ? res.data : String(res.data);
+    console.log(`[CRAWLER]    Scrape.do fetch OK for ${url} (${res.status}, ${text.length} bytes)`);
+    return text;
+  }
+
+  throw new Error(`Could not fetch ${url} — direct failed and no SCRAPE_DO_TOKEN configured`);
+}
 
 async function getSitemapsFromRobots(domain) {
   const sitemaps = [];
   try {
     console.log("[CRAWLER] Checking robots.txt...");
-    const res = await axios.get(`${domain}/robots.txt`, {
-      timeout: 10000,
-      headers: { "User-Agent": randomUA() },
-    });
-    for (const line of res.data.split("\n")) {
+    const text = await fetchTextContent(`${domain}/robots.txt`);
+    for (const line of text.split("\n")) {
       if (line.toLowerCase().startsWith("sitemap:")) {
         const sm = line.split(":").slice(1).join(":").trim();
         if (sm) sitemaps.push(sm);
@@ -238,22 +315,21 @@ async function resolveSitemap(sitemapUrl, visited = new Set()) {
   const urls = [];
   try {
     console.log(`[CRAWLER]  → Fetching sitemap: ${sitemapUrl}`);
-    const res = await axios.get(sitemapUrl, {
-      timeout: 15000,
-      headers: { "User-Agent": randomUA() },
-      responseType: "text",
-    });
+    const text = await fetchTextContent(sitemapUrl);
 
-    const xml = await parseStringPromise(res.data, { explicitArray: true });
+    const xml = await parseStringPromise(text, { explicitArray: true });
 
     // Sitemap index — recurse into each child sitemap
     if (xml.sitemapindex) {
       const children = xml.sitemapindex.sitemap || [];
       for (const child of children) {
         const loc = child.loc?.[0];
-        if (loc) {
+        // Skip .xml.gz — we can't decompress them; they'd fail anyway
+        if (loc && !loc.toLowerCase().endsWith(".xml.gz")) {
           const nested = await resolveSitemap(loc, visited);
           urls.push(...nested);
+        } else if (loc) {
+          console.log(`[CRAWLER]  → Skipping compressed sitemap: ${loc}`);
         }
       }
     }
@@ -277,35 +353,107 @@ async function resolveSitemap(sitemapUrl, visited = new Set()) {
 }
 
 /** Collect seed URLs from all sitemaps — these prime the BFS queue */
-async function getSeedUrls(baseUrl) {
+async function getSeedUrls(baseUrl, maxPages = 500) {
   const domain = getDomain(baseUrl);
   const seed = new Set();
 
   const robotsSitemaps = await getSitemapsFromRobots(domain);
-  if (!robotsSitemaps.some(s => s.includes("sitemap.xml"))) {
-    robotsSitemaps.push(`${domain}/sitemap.xml`);
+  // Always try common sitemap paths as fallbacks
+  const commonSitemaps = [
+    `${domain}/sitemap.xml`,
+    `${domain}/sitemap_index.xml`,
+    `${domain}/wp-sitemap.xml`,
+  ];
+  for (const sm of commonSitemaps) {
+    if (!robotsSitemaps.some(r => r === sm || r.includes(new URL(sm).pathname))) {
+      robotsSitemaps.push(sm);
+    }
   }
 
   const visited = new Set();
   for (const sm of robotsSitemaps) {
+    if (seed.size >= maxPages) break;
     const urls = await resolveSitemap(sm, visited);
-    urls
-      .filter(u => isPageUrl(u) && u.startsWith(domain))
-      .forEach(u => seed.add(cleanUrl(u)));
+    for (const u of urls) {
+      if (seed.size >= maxPages) break;
+      // Accept both www and non-www variants of the domain
+      if (isPageUrl(u) && isSameSite(u, domain)) seed.add(cleanUrl(u));
+    }
   }
 
   // Always seed with homepage
   seed.add(cleanUrl(domain + "/"));
   seed.add(cleanUrl(baseUrl));
 
-  console.log(`[CRAWLER] Seeded ${seed.size} URLs from sitemaps`);
+  console.log(`[CRAWLER] Seeded ${seed.size} URLs from sitemaps (capped at ${maxPages})`);
   return [...seed];
 }
 
 // ---------------------------------------------------------------------------
-// Per-page fetch with proxy fallback
+// Scrape.do integration — routes all page fetches through scrape.do when
+// SCRAPE_DO_TOKEN is set. Retries on 429 / timeout with exponential backoff.
 // ---------------------------------------------------------------------------
-async function fetchPage(url) {
+async function fetchPageScrapeDo(url) {
+  const token = process.env.SCRAPE_DO_TOKEN;
+  const apiUrl = `https://api.scrape.do/?token=${token}&url=${encodeURIComponent(url)}&render=false`;
+
+  const MAX_RETRIES = 2;
+  const BASE_DELAY_MS = 1000;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const start = Date.now();
+    try {
+      const response = await axios.get(apiUrl, {
+        timeout: 60000,
+        validateStatus: () => true,
+        headers: { "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
+      });
+      const loadTime = ((Date.now() - start) / 1000).toFixed(2);
+      const html = typeof response.data === "string" ? response.data : String(response.data);
+
+      // 429 from Scrape.do itself (not the target site) — wait and retry
+      if (response.status === 429 && attempt < MAX_RETRIES) {
+        const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+        console.log(`[SCRAPE.DO] Rate limited for ${url} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+
+      return { response: { status: response.status, headers: response.headers }, loadTime, html, wasBlocked: false };
+    } catch (err) {
+      const isTimeout = err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT' || err.message?.includes('timeout');
+      if (isTimeout && attempt < MAX_RETRIES) {
+        const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+        console.log(`[SCRAPE.DO] Timeout for ${url} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      return { response: null, loadTime: 0, html: "", error: err, wasBlocked: false };
+    }
+  }
+
+  // All retries exhausted
+  return { response: null, loadTime: 0, html: "", error: new Error('Max retries exceeded'), wasBlocked: false };
+}
+
+// ---------------------------------------------------------------------------
+// Per-page fetch — uses Scrape.do if token is configured, otherwise falls
+// back to direct axios requests with proxy + stealth browser fallback.
+// ---------------------------------------------------------------------------
+async function fetchPage(url, blockedHosts = null) {
+  // Route through Scrape.do when token is available
+  if (process.env.SCRAPE_DO_TOKEN) {
+    return fetchPageScrapeDo(url);
+  }
+
+  // Fast-path: if this host is already known to be CF-blocked, skip direct+proxy
+  if (blockedHosts) {
+    const host = new URL(url).hostname;
+    if (blockedHosts.has(host)) {
+      return { response: null, loadTime: 0, html: "", wasBlocked: true };
+    }
+  }
+
   const proxyConfig = getProxyConfig();
 
   const attempt = async (useProxy) => {
@@ -330,16 +478,28 @@ async function fetchPage(url) {
 
   try {
     let result = await attempt(false);
+    let wasBlocked = isBlocked(result.response?.status, result.response?.headers, result.html);
+
     // If blocked (CF/WAF), retry through proxy
-    if (proxyConfig && isBlocked(result.response?.status, result.response?.headers, result.html)) {
+    if (proxyConfig && wasBlocked) {
       console.log(`[CRAWLER] Blocked at ${url} — retrying via proxy`);
-      try { result = await attempt(true); } catch {}
+      try {
+        result = await attempt(true);
+        wasBlocked = isBlocked(result.response?.status, result.response?.headers, result.html);
+        if (wasBlocked) {
+          console.log(`[CRAWLER] Still blocked via proxy at ${url} — status=${result.response?.status}, body-len=${result.html?.length}`);
+        }
+      } catch (proxyErr) {
+        console.log(`[CRAWLER] Proxy attempt threw: ${proxyErr.message}`);
+        // wasBlocked stays true — stealth will take over
+      }
+    } else if (wasBlocked) {
+      console.log(`[CRAWLER] Blocked at ${url} (no proxy configured) — status=${result.response?.status}`);
     }
-    // If still blocked even via proxy, stealth browser pool will handle it
-    // (handled in crawlPage — pool passed as argument)
-    return result;
+
+    return { ...result, wasBlocked };
   } catch (err) {
-    return { response: null, loadTime: 0, html: "", error: err };
+    return { response: null, loadTime: 0, html: "", error: err, wasBlocked: false };
   }
 }
 
@@ -379,10 +539,19 @@ function analyzePageHtml(html, url, domain, status, loadTime, pageSizeKb) {
       const clean = cleanUrl(abs);
       if (clean.startsWith(domain)) {
         internalLinks++;
-        // Follow links unless page declares nofollow
+        // Follow links unless page declares nofollow — also accept www/non-www variant
         if (!isNofollow && isPageUrl(clean)) discoveredLinks.add(clean);
       } else if (href.startsWith("http")) {
-        externalLinks++;
+        // Check if it's a www/non-www variant of our domain
+        const altDomain = domain.includes("://www.")
+          ? domain.replace("://www.", "://")
+          : domain.replace("://", "://www.");
+        if (clean.startsWith(altDomain)) {
+          internalLinks++;
+          if (!isNofollow && isPageUrl(clean)) discoveredLinks.add(clean);
+        } else {
+          externalLinks++;
+        }
       }
     } catch {}
   });
@@ -435,11 +604,13 @@ function analyzePageHtml(html, url, domain, status, loadTime, pageSizeKb) {
 }
 
 /** Fetch + analyze a single page, returns { page, links } */
-async function crawlPage(url, domain, stealthPool = null) {
-  let { response, loadTime, html, error } = await fetchPage(url);
+async function crawlPage(url, domain, stealthPool = null, blockedHosts = null) {
+  let { response, loadTime, html, error, wasBlocked } = await fetchPage(url, blockedHosts);
 
-  // If axios (direct + proxy) both returned a CF block, try stealth browser
-  if (stealthPool && (!error) && response && isBlocked(response.status, response.headers, html)) {
+  // If direct + proxy both blocked/failed, use stealth browser (handles CF JS challenges)
+  if (stealthPool && wasBlocked) {
+    // Mark this host so all future pages skip the failed direct+proxy attempts
+    if (blockedHosts) blockedHosts.add(new URL(url).hostname);
     console.log(`[CRAWLER] CF block persists — using stealth browser for ${url}`);
     await stealthPool.launch();
     const stealthResult = await fetchPageStealth(url, stealthPool);
@@ -448,6 +619,8 @@ async function crawlPage(url, domain, stealthPool = null) {
       loadTime = stealthResult.loadTime;
       html = stealthResult.html;
       error = null;
+    } else if (stealthResult.error) {
+      error = stealthResult.error; // propagate for accurate error messages
     }
   }
 
@@ -534,13 +707,29 @@ function buildSummary(results) {
 async function takeHomepageScreenshots(url) {
   let browser;
   try {
-    browser = await puppeteer.launch({
+    // Use stealth browser to bypass Cloudflare on screenshot
+    browser = await puppeteerExtra.launch({
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
     });
     const page = await browser.newPage();
+    await page.setUserAgent(randomUA());
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
     await page.setViewport({ width: 1920, height: 1080 });
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    // Give JS-rendered / CF-challenge pages time to resolve
+    await page.waitForNetworkIdle({ timeout: 8000, idleTime: 800 }).catch(() => {});
+    // If still on CF challenge, wait for navigation
+    const isCF = await page.evaluate(() => {
+      const t = document.body?.innerText?.slice(0, 400)?.toLowerCase() ?? "";
+      return t.includes("just a moment") || t.includes("checking your browser") ||
+             t.includes("security verification") || t.includes("performing security");
+    }).catch(() => false);
+    if (isCF) {
+      console.log("[CRAWLER] CF challenge on screenshot — waiting for redirect...");
+      await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+      await page.waitForNetworkIdle({ timeout: 6000, idleTime: 800 }).catch(() => {});
+    }
     const desktop = await page.screenshot({ encoding: "base64", fullPage: false });
     await page.setViewport({ width: 390, height: 844 });
     const mobile = await page.screenshot({ encoding: "base64", fullPage: false });
@@ -557,85 +746,112 @@ async function takeHomepageScreenshots(url) {
 }
 
 // ---------------------------------------------------------------------------
-// Main export — BFS recursive crawler
+// Main export — Sitemap + Homepage strategy (no BFS)
 // ---------------------------------------------------------------------------
 
 /**
  * crawlSite(baseUrl, options)
  *
- * Seeds from sitemaps, then follows every internal link found on every crawled
- * page (BFS). Discovers all pages automatically regardless of sitemap coverage.
+ * 1. Pulls page URLs from sitemaps (up to maxPages)
+ * 2. Fetches the homepage and extracts internal links to fill any gaps
+ * 3. Fetches every collected URL in parallel batches (concurrency=5)
+ * 4. No recursive link-following — saves Scrape.do credits
  *
  * @param {string} baseUrl
  * @param {object} options
- *   @param {number} [options.concurrency=15]  Parallel workers
- *   @param {number} [options.maxPages=2000]   Hard cap — prevents runaway on huge sites
- *   @param {function} [options.onProgress]    (crawled, total) callback
+ *   @param {number} [options.concurrency=5]   Parallel fetch workers
+ *   @param {number} [options.maxPages=500]    Hard cap on pages to crawl
+ *   @param {function} [options.onProgress]   (crawled, total) callback
  */
 export async function crawlSite(baseUrl, options = {}) {
   const {
-    concurrency = 15,
-    maxPages = 2000,
+    concurrency = 5,
+    maxPages = 500,
     onProgress = null,
   } = options;
 
   baseUrl = normalizeUrl(baseUrl);
   const domain = getDomain(baseUrl);
-  console.log(`[CRAWLER] Starting BFS crawl: ${baseUrl} (concurrency=${concurrency}, maxPages=${maxPages})`);
+  const usingScrapeDo = !!process.env.SCRAPE_DO_TOKEN;
+  console.log(`[CRAWLER] Starting crawl: ${baseUrl} (concurrency=${concurrency}, maxPages=${maxPages}, via=${usingScrapeDo ? 'scrape.do' : 'direct'})`);
 
-  // Stealth pool — launched lazily only if CF blocks axios + proxy
-  const stealthPool = new StealthBrowserPool(Math.min(concurrency, 5), getProxyConfig());
+  // Stealth pool only needed when NOT using Scrape.do
+  const stealthPool = usingScrapeDo ? null : new StealthBrowserPool(Math.min(concurrency, 10), getProxyConfig());
+  const blockedHosts = usingScrapeDo ? null : new Set();
 
-  // Step 0: Homepage screenshot
-  console.log("[CRAWLER] Taking homepage screenshot...");
-  const { screenshot, screenshotMobile } = await takeHomepageScreenshots(baseUrl);
+  // Step 0: Screenshot runs in parallel with URL discovery
+  const screenshotPromise = takeHomepageScreenshots(baseUrl);
 
-  // Step 1: Seed queue from sitemaps
-  const seedUrls = await getSeedUrls(baseUrl);
+  // Step 1: Collect URLs from sitemaps
+  let urlSet = new Set(await getSeedUrls(baseUrl, maxPages));
+  console.log(`[CRAWLER] ${urlSet.size} URLs from sitemaps`);
 
-  // BFS state — shared mutable queue (JS is single-threaded; shift() is atomic)
-  const queue = [...seedUrls];
-  const seen  = new Set(queue);   // all URLs ever enqueued (prevents duplicates)
-  const results = [];             // completed page analyses
+  // Step 2: Fetch homepage and extract internal links to fill gaps
+  if (urlSet.size < maxPages) {
+    console.log(`[CRAWLER] Fetching homepage to discover additional links...`);
+    const homeFetch = await fetchPage(baseUrl, blockedHosts);
+    if (homeFetch.html) {
+      const $ = cheerio.load(homeFetch.html);
+      $('a[href]').each((_, el) => {
+        if (urlSet.size >= maxPages) return false;
+        const href = $(el).attr('href') || '';
+        try {
+          const abs = cleanUrl(new URL(href, baseUrl).href);
+          if (isPageUrl(abs) && isSameSite(abs, domain)) urlSet.add(abs);
+        } catch {}
+      });
+      console.log(`[CRAWLER] ${urlSet.size} URLs after homepage link extraction`);
+    }
+  }
 
-  console.log(`[CRAWLER] BFS starting with ${queue.length} seed URLs...`);
+  // Finalise the ordered list, capped at maxPages
+  const totalDiscoveredUrls = urlSet.size;
+  const allUrls = [...urlSet].slice(0, maxPages);
+  const uncrawledUrls = totalDiscoveredUrls > maxPages ? [...urlSet].slice(maxPages) : [];
+  const wasCapped = totalDiscoveredUrls > maxPages;
+  const total = allUrls.length;
+  console.log(`[CRAWLER] Crawling ${total}/${totalDiscoveredUrls} pages with concurrency ${concurrency}${wasCapped ? ` (capped at ${maxPages})` : ''}...`);
 
-  // Step 2: N workers drain the queue; new links found are pushed to the back
+  // Step 3: Fetch + analyse all pages in concurrent batches — no BFS
+  const results = [];
+  let cursor = 0;
+  // Small inter-request delay per worker to avoid hammering Scrape.do
+  const INTER_REQUEST_DELAY_MS = process.env.SCRAPE_DO_TOKEN ? 150 : 0;
+
   const worker = async () => {
     while (true) {
-      if (results.length >= maxPages) break;
-      const url = queue.shift();
-      if (url === undefined) break; // queue drained
-
-      const { page, links } = await crawlPage(url, domain, stealthPool);
+      const idx = cursor++;
+      if (idx >= allUrls.length) break;
+      const url = allUrls[idx];
+      const { page } = await crawlPage(url, domain, stealthPool, blockedHosts);
       results.push(page);
-
-      // Enqueue newly discovered internal links
-      for (const link of links) {
-        if (!seen.has(link) && results.length + queue.length < maxPages) {
-          seen.add(link);
-          queue.push(link);
-        }
-      }
-
-      const total = results.length + queue.length;
-      console.log(`[CRAWLER] Progress: ${results.length}/${total}`);
-      if (onProgress) onProgress(results.length, total);
+      const done = results.length;
+      console.log(`[CRAWLER] Progress: ${done}/${total}`);
+      if (onProgress) onProgress(done, total);
+      if (INTER_REQUEST_DELAY_MS > 0) await new Promise(r => setTimeout(r, INTER_REQUEST_DELAY_MS));
     }
   };
 
-  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  // Wait for all workers and screenshot in parallel
+  const [, { screenshot, screenshotMobile }] = await Promise.all([
+    Promise.all(Array.from({ length: concurrency }, () => worker())),
+    screenshotPromise,
+  ]);
 
   // Clean up stealth browser if it was used
-  await stealthPool.close();
+  if (stealthPool) await stealthPool.close();
 
   const summary = buildSummary(results);
-  console.log(`[CRAWLER] Done. ${results.length} pages crawled, ${seen.size} total discovered.`);
+  console.log(`[CRAWLER] Done. ${results.length} pages crawled.`);
 
   return {
     pages: results,
     summary,
-    discoveredUrls: seen.size,
+    crawledPages: results.length,
+    totalDiscoveredUrls,
+    wasCapped,
+    uncrawledUrls,
+    discoveredUrls: total,
     crawledAt: new Date().toISOString(),
     screenshot,
     screenshotMobile,

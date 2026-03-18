@@ -338,7 +338,7 @@ app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
     return res.status(503).json({ success: false, error: queueErr.message });
   }
 
-  const CRAWL_TIMEOUT_MS = parseInt(process.env.CRAWL_TIMEOUT_MS || "900000", 10); // 15 min
+  const CRAWL_TIMEOUT_MS = parseInt(process.env.CRAWL_TIMEOUT_MS || "1200000", 10); // 20 min (crawl + lighthouse)
 
   let released = false;
   const release = () => { if (!released) { released = true; crawlSemaphore.release(); } };
@@ -353,17 +353,35 @@ app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
   try {
     const options = {
       concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : 15,
-      maxPages: typeof maxPages === 'number' && maxPages > 0 ? Math.min(maxPages, 5000) : 2000,
+      maxPages: Math.min(typeof maxPages === 'number' && maxPages > 0 ? maxPages : 500, 500),
     };
 
     console.log(`[BACKEND] Starting site crawl for: ${url}`);
     const result = await crawlSite(url, options);
+    console.log(`[BACKEND] Site crawl completed: ${result.pages.length} pages — running Lighthouse...`);
+
+    // Run Lighthouse BEFORE releasing the crawl semaphore so no new crawl
+    // can start while Lighthouse is consuming CPU on this same job.
+    let psi = null;
+    try {
+      await lighthouseSemaphore.acquire();
+      try {
+        console.log(`[LIGHTHOUSE] Starting audit for: ${url}`);
+        const { desktop, mobile } = await runLighthouseAudit(url);
+        psi = { desktop, mobile };
+        console.log(`[LIGHTHOUSE] Audit completed for: ${url}`);
+      } finally {
+        lighthouseSemaphore.release();
+      }
+    } catch (lhErr) {
+      console.warn(`[LIGHTHOUSE] Audit skipped (non-fatal): ${lhErr.message}`);
+    }
+
     clearTimeout(timeoutHandle);
     release();
-    console.log(`[BACKEND] Site crawl completed: ${result.pages.length} pages`);
 
     if (!res.headersSent) {
-      res.json({ success: true, data: result });
+      res.json({ success: true, data: { ...result, psi } });
     }
   } catch (error) {
     clearTimeout(timeoutHandle);
@@ -374,6 +392,65 @@ app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// Shared Lighthouse helper — serialized via lighthouseSemaphore
+// ---------------------------------------------------------------------------
+async function runLighthouseAudit(url) {
+  const { launch } = await import('chrome-launcher');
+  const { default: lighthouse } = await import('lighthouse');
+
+  const CHROME_FLAGS = [
+    '--headless', '--no-sandbox', '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage', '--disable-extensions',
+    '--disable-background-networking', '--disable-default-apps',
+  ];
+
+  const runAudit = async (strategy, chrome) => {
+    const cfg = {
+      extends: 'lighthouse:default',
+      settings: {
+        onlyCategories: ['performance'],
+        formFactor: strategy,
+        screenEmulation: strategy === 'desktop'
+          ? { mobile: false, width: 1350, height: 940, deviceScaleFactor: 1, disabled: false }
+          : { mobile: true, width: 375, height: 667, deviceScaleFactor: 2, disabled: false },
+        throttlingMethod: 'simulate',
+        maxWaitForFcp: 30000,
+        maxWaitForLoad: 45000,
+      },
+    };
+    const result = await lighthouse(url, { port: chrome.port, output: 'json', logLevel: 'error' }, cfg);
+    return result.lhr;
+  };
+
+  const extractMetrics = (lhr) => {
+    const a = lhr.audits;
+    const score = Math.round((lhr.categories?.performance?.score ?? 0) * 100);
+    const fmt = (key) => a[key]?.displayValue ?? 'N/A';
+    const num = (key) => a[key]?.numericValue ?? 0;
+    return {
+      score,
+      lcp: fmt('largest-contentful-paint'),  lcpVal: num('largest-contentful-paint'),
+      tbt: fmt('total-blocking-time'),        tbtVal: num('total-blocking-time'),
+      cls: fmt('cumulative-layout-shift'),    clsVal: num('cumulative-layout-shift'),
+      fcp: fmt('first-contentful-paint'),
+      si:  fmt('speed-index'),
+    };
+  };
+
+  // Lighthouse uses global process-level performance marks — parallel runs on
+  // the same Node.js process corrupt each other even with separate Chrome instances.
+  // Launch one Chrome, run both audits sequentially on it.
+  const chrome = await launch({ chromeFlags: CHROME_FLAGS });
+  try {
+    const desktopLhr = await runAudit('desktop', chrome);
+    const mobileLhr  = await runAudit('mobile', chrome);
+    return { desktop: extractMetrics(desktopLhr), mobile: extractMetrics(mobileLhr) };
+  } finally {
+    await chrome.kill().catch(() => {});
+  }
+}
 
 // Lighthouse Performance endpoint — runs real Lighthouse audit on any URL
 app.post('/api/lighthouse', authenticateApiKey, async (req, res) => {
@@ -388,60 +465,15 @@ app.post('/api/lighthouse', authenticateApiKey, async (req, res) => {
     return res.status(503).json({ success: false, error: queueErr.message });
   }
 
-  let chrome;
   try {
     console.log(`[LIGHTHOUSE] Starting audit for: ${url}`);
-
-    const { launch } = await import('chrome-launcher');
-    const { default: lighthouse } = await import('lighthouse');
-
-    chrome = await launch({ chromeFlags: ['--headless', '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
-
-    const runAudit = async (strategy) => {
-      const cfg = {
-        extends: 'lighthouse:default',
-        settings: {
-          onlyCategories: ['performance'],
-          formFactor: strategy,
-          screenEmulation: strategy === 'desktop'
-            ? { mobile: false, width: 1350, height: 940, deviceScaleFactor: 1, disabled: false }
-            : { mobile: true, width: 375, height: 667, deviceScaleFactor: 2, disabled: false },
-          throttlingMethod: 'simulate',
-        },
-      };
-      const result = await lighthouse(url, { port: chrome.port, output: 'json', logLevel: 'error' }, cfg);
-      return result.lhr;
-    };
-
-    // Must run sequentially — Lighthouse cannot handle concurrent audits on the same Chrome instance
-    const desktopLhr = await runAudit('desktop');
-    const mobileLhr  = await runAudit('mobile');
-
-    const extractMetrics = (lhr) => {
-      const a = lhr.audits;
-      const score = Math.round((lhr.categories?.performance?.score ?? 0) * 100);
-      const fmt = (key) => a[key]?.displayValue ?? 'N/A';
-      const num = (key) => a[key]?.numericValue ?? 0;
-      return {
-        score,
-        lcp: fmt('largest-contentful-paint'),  lcpVal: num('largest-contentful-paint'),
-        tbt: fmt('total-blocking-time'),        tbtVal: num('total-blocking-time'),
-        cls: fmt('cumulative-layout-shift'),    clsVal: num('cumulative-layout-shift'),
-        fcp: fmt('first-contentful-paint'),
-        si:  fmt('speed-index'),
-      };
-    };
-
+    const { desktop, mobile } = await runLighthouseAudit(url);
     console.log(`[LIGHTHOUSE] Audit completed for: ${url}`);
-    res.json({ success: true, desktop: extractMetrics(desktopLhr), mobile: extractMetrics(mobileLhr) });
-
+    res.json({ success: true, desktop, mobile });
   } catch (error) {
     console.error('[LIGHTHOUSE] Error:', error.message);
     res.status(500).json({ success: false, error: error.message });
   } finally {
-    if (chrome) {
-      try { await chrome.kill(); } catch (_) {}
-    }
     lighthouseSemaphore.release();
   }
 });
