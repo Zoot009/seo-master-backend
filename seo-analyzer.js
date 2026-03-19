@@ -1,6 +1,15 @@
 import * as cheerio from "cheerio";
 import puppeteer from "puppeteer";
 
+// Thrown when the failure is caused by the target site (DNS, SSL, etc.) — not a server/infra error.
+// The backend uses this to return 422 instead of 500 so the caller knows not to retry.
+class SiteError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SiteError';
+  }
+}
+
 // fetch() with AbortSignal timeout — never hangs, never throws
 async function safeFetch(url, options = {}, timeoutMs = 6000) {
   const controller = new AbortController();
@@ -14,22 +23,23 @@ async function safeFetch(url, options = {}, timeoutMs = 6000) {
   }
 }
 
-// Map low-level Puppeteer/network errors to human-readable messages
+// Map low-level Puppeteer/network errors to SiteErrors (won't be retried by the caller).
+// Does nothing if the error isn't a known site-specific failure.
 function classifyError(err) {
   const msg = err.message || "";
   if (msg.includes("ERR_NAME_NOT_RESOLVED") || msg.includes("NS_ERROR_UNKNOWN_HOST"))
-    return "The domain could not be found. Please check the URL and try again.";
+    throw new SiteError("The domain could not be found. Please check the URL and try again.");
   if (msg.includes("ERR_CONNECTION_REFUSED"))
-    return "The site refused the connection. It may be down or blocking automated access.";
+    throw new SiteError("The site refused the connection. It may be down or blocking automated access.");
   if (msg.includes("ERR_CONNECTION_TIMED_OUT") || msg.includes("ETIMEDOUT"))
-    return "The site took too long to respond. Try again later.";
+    throw new SiteError("The site took too long to respond. Try again later.");
   if (msg.includes("ERR_SSL") || msg.includes("SSL_ERROR") || msg.includes("certificate"))
-    return "There is an SSL/certificate problem with this site.";
+    throw new SiteError("There is an SSL/certificate problem with this site.");
   if (msg.includes("ERR_TOO_MANY_REDIRECTS"))
-    return "The site has too many redirects and cannot be loaded.";
+    throw new SiteError("The site has too many redirects and cannot be loaded.");
   if (msg.includes("ERR_ABORTED") || msg.includes("net::ERR"))
-    return `A network error occurred while loading the page: ${msg}`;
-  return null;
+    throw new SiteError(`A network error occurred while loading the page: ${msg}`);
+  // Not a site-specific error — caller handles it (timeout, etc.)
 }
 
 export async function analyzeSEO(url) {
@@ -99,8 +109,7 @@ export async function analyzeSEO(url) {
         await page.waitForNetworkIdle({ timeout: 5000, idleTime: 500 }).catch(() => {});
         break;
       } catch (navErr) {
-        const friendly = classifyError(navErr);
-        if (friendly) throw new Error(friendly); // hard network error — don't retry
+        classifyError(navErr); // throws SiteError if it's a site-specific failure
         if (attempt === 1) {
           console.log(`[ANALYZER] Navigation timeout on attempt 1, retrying...`);
           await new Promise((r) => setTimeout(r, 1500));

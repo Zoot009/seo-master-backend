@@ -43,8 +43,13 @@ const API_KEY = process.env.API_KEY;
 // ---------------------------------------------------------------------------
 function validateHttpUrl(raw) {
   if (!raw || typeof raw !== 'string') return null;
+  // Add protocol if missing so bare domains like "example.com" are accepted
+  let normalized = raw.trim();
+  if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
+    normalized = 'https://' + normalized;
+  }
   let parsed;
-  try { parsed = new URL(raw); } catch { return null; }
+  try { parsed = new URL(normalized); } catch { return null; }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
   const host = parsed.hostname.toLowerCase();
   // Block loopback, link-local, and private RFC-1918 ranges
@@ -233,9 +238,12 @@ app.post('/api/analyze', authenticateApiKey, async (req, res) => {
   } catch (error) {
     clearTimeout(timeoutHandle);
     release();
-    console.error('[BACKEND] Analysis error:', error);
+    console.error('[BACKEND] Analysis error:', error.message);
     if (!res.headersSent) {
-      res.status(500).json({
+      // SiteError = the TARGET site has a problem (DNS, SSL, etc.) → 422, caller should not retry
+      // Any other error = server/infra failure → 500, caller may retry
+      const statusCode = error.name === 'SiteError' ? 422 : 500;
+      res.status(statusCode).json({
         success: false,
         error: error.message || 'Failed to analyze website',
         reportId,
