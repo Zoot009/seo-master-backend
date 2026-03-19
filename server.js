@@ -395,34 +395,11 @@ app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // Shared Lighthouse helper — serialized via lighthouseSemaphore
+// Uses puppeteer (already installed) to launch Chrome so chrome-launcher
+// is not required as a separate dependency.
 // ---------------------------------------------------------------------------
 async function runLighthouseAudit(url) {
-  const { launch } = await import('chrome-launcher');
   const { default: lighthouse } = await import('lighthouse');
-
-  const CHROME_FLAGS = [
-    '--headless', '--no-sandbox', '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage', '--disable-extensions',
-    '--disable-background-networking', '--disable-default-apps',
-  ];
-
-  const runAudit = async (strategy, chrome) => {
-    const cfg = {
-      extends: 'lighthouse:default',
-      settings: {
-        onlyCategories: ['performance'],
-        formFactor: strategy,
-        screenEmulation: strategy === 'desktop'
-          ? { mobile: false, width: 1350, height: 940, deviceScaleFactor: 1, disabled: false }
-          : { mobile: true, width: 375, height: 667, deviceScaleFactor: 2, disabled: false },
-        throttlingMethod: 'simulate',
-        maxWaitForFcp: 30000,
-        maxWaitForLoad: 45000,
-      },
-    };
-    const result = await lighthouse(url, { port: chrome.port, output: 'json', logLevel: 'error' }, cfg);
-    return result.lhr;
-  };
 
   const extractMetrics = (lhr) => {
     const a = lhr.audits;
@@ -439,16 +416,43 @@ async function runLighthouseAudit(url) {
     };
   };
 
-  // Lighthouse uses global process-level performance marks — parallel runs on
-  // the same Node.js process corrupt each other even with separate Chrome instances.
-  // Launch one Chrome, run both audits sequentially on it.
-  const chrome = await launch({ chromeFlags: CHROME_FLAGS });
+  const runAudit = async (strategy, port) => {
+    const cfg = {
+      extends: 'lighthouse:default',
+      settings: {
+        onlyCategories: ['performance'],
+        formFactor: strategy,
+        screenEmulation: strategy === 'desktop'
+          ? { mobile: false, width: 1350, height: 940, deviceScaleFactor: 1, disabled: false }
+          : { mobile: true, width: 375, height: 667, deviceScaleFactor: 2, disabled: false },
+        throttlingMethod: 'simulate',
+        maxWaitForFcp: 30000,
+        maxWaitForLoad: 45000,
+      },
+    };
+    const result = await lighthouse(url, { port, output: 'json', logLevel: 'error' }, cfg);
+    if (!result || !result.lhr) throw new Error('Lighthouse returned no result');
+    return result.lhr;
+  };
+
+  // Launch Chrome via puppeteer — already installed, avoids chrome-launcher dep.
+  // Run both audits sequentially on the same browser instance.
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--disable-extensions', '--disable-background-networking',
+    ],
+  });
   try {
-    const desktopLhr = await runAudit('desktop', chrome);
-    const mobileLhr  = await runAudit('mobile', chrome);
+    const wsEndpoint = browser.wsEndpoint();
+    const port = parseInt(new URL(wsEndpoint).port, 10);
+    const desktopLhr = await runAudit('desktop', port);
+    const mobileLhr  = await runAudit('mobile',  port);
     return { desktop: extractMetrics(desktopLhr), mobile: extractMetrics(mobileLhr) };
   } finally {
-    await chrome.kill().catch(() => {});
+    await browser.close().catch(() => {});
   }
 }
 

@@ -6,6 +6,7 @@
  *
  * Proxy support: set PROXY_URL=http://user:pass@host:port in .env
  * Proxy is only used as a fallback when direct requests are blocked (403/CF).
+ * Stealth browser (puppeteer-extra-stealth) is the final fallback for Cloudflare-protected sites.
  */
 
 import axios from "axios";
@@ -241,52 +242,24 @@ function isSameSite(url, domain) {
 
 /**
  * Fetch raw text content (robots.txt, XML sitemaps).
- * Always tries a direct request first — fast and free.
- * Falls back to Scrape.do only when the direct attempt fails or returns
- * a blocked/empty response, so CF-protected sitemaps still work.
+ * Uses a direct axios request.
  */
 async function fetchTextContent(url) {
-  // --- 1. Direct fetch (no proxy, no cost) ---
-  try {
-    const res = await axios.get(url, {
-      timeout: 15000,
-      headers: {
-        "User-Agent": randomUA(),
-        "Accept": "text/xml,application/xml,text/html,*/*;q=0.8",
-      },
-      responseType: "text",
-      validateStatus: () => true,
-    });
-    const text = typeof res.data === "string" ? res.data : String(res.data);
-    // Accept if status is 2xx/3xx AND body is non-empty and looks like text content
-    if (res.status < 400 && text.trim().length > 64) {
-      console.log(`[CRAWLER]    direct fetch OK for ${url} (${res.status}, ${text.length} bytes)`);
-      return text;
-    }
-    console.log(`[CRAWLER]    direct fetch got ${res.status} or empty body for ${url} — trying Scrape.do`);
-  } catch (directErr) {
-    console.log(`[CRAWLER]    direct fetch failed for ${url} (${directErr.message}) — trying Scrape.do`);
-  }
-
-  // --- 2. Scrape.do fallback (handles Cloudflare / WAF protection) ---
-  if (process.env.SCRAPE_DO_TOKEN) {
-    const token = process.env.SCRAPE_DO_TOKEN;
-    const apiUrl = `https://api.scrape.do/?token=${token}&url=${encodeURIComponent(url)}&render=false`;
-    const res = await axios.get(apiUrl, {
-      timeout: 30000,
-      validateStatus: () => true,
-      headers: { "Accept": "text/xml,application/xml,text/html,*/*;q=0.8" },
-    });
-    // Scrape.do sometimes returns a JSON error object — surface it clearly
-    if (typeof res.data === "object" && res.data !== null) {
-      throw new Error(`Scrape.do returned JSON error: ${JSON.stringify(res.data).slice(0, 200)}`);
-    }
-    const text = typeof res.data === "string" ? res.data : String(res.data);
-    console.log(`[CRAWLER]    Scrape.do fetch OK for ${url} (${res.status}, ${text.length} bytes)`);
+  const res = await axios.get(url, {
+    timeout: 15000,
+    headers: {
+      "User-Agent": randomUA(),
+      "Accept": "text/xml,application/xml,text/html,*/*;q=0.8",
+    },
+    responseType: "text",
+    validateStatus: () => true,
+  });
+  const text = typeof res.data === "string" ? res.data : String(res.data);
+  if (res.status < 400 && text.trim().length > 64) {
+    console.log(`[CRAWLER]    direct fetch OK for ${url} (${res.status}, ${text.length} bytes)`);
     return text;
   }
-
-  throw new Error(`Could not fetch ${url} — direct failed and no SCRAPE_DO_TOKEN configured`);
+  throw new Error(`Could not fetch ${url} — status ${res.status} or empty body`);
 }
 
 async function getSitemapsFromRobots(domain) {
@@ -390,62 +363,10 @@ async function getSeedUrls(baseUrl, maxPages = 500) {
 }
 
 // ---------------------------------------------------------------------------
-// Scrape.do integration — routes all page fetches through scrape.do when
-// SCRAPE_DO_TOKEN is set. Retries on 429 / timeout with exponential backoff.
-// ---------------------------------------------------------------------------
-async function fetchPageScrapeDo(url) {
-  const token = process.env.SCRAPE_DO_TOKEN;
-  const apiUrl = `https://api.scrape.do/?token=${token}&url=${encodeURIComponent(url)}&render=false`;
-
-  const MAX_RETRIES = 2;
-  const BASE_DELAY_MS = 1000;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const start = Date.now();
-    try {
-      const response = await axios.get(apiUrl, {
-        timeout: 60000,
-        validateStatus: () => true,
-        headers: { "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
-      });
-      const loadTime = ((Date.now() - start) / 1000).toFixed(2);
-      const html = typeof response.data === "string" ? response.data : String(response.data);
-
-      // 429 from Scrape.do itself (not the target site) — wait and retry
-      if (response.status === 429 && attempt < MAX_RETRIES) {
-        const delay = BASE_DELAY_MS * Math.pow(2, attempt);
-        console.log(`[SCRAPE.DO] Rate limited for ${url} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-
-      return { response: { status: response.status, headers: response.headers }, loadTime, html, wasBlocked: false };
-    } catch (err) {
-      const isTimeout = err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT' || err.message?.includes('timeout');
-      if (isTimeout && attempt < MAX_RETRIES) {
-        const delay = BASE_DELAY_MS * Math.pow(2, attempt);
-        console.log(`[SCRAPE.DO] Timeout for ${url} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-      return { response: null, loadTime: 0, html: "", error: err, wasBlocked: false };
-    }
-  }
-
-  // All retries exhausted
-  return { response: null, loadTime: 0, html: "", error: new Error('Max retries exceeded'), wasBlocked: false };
-}
-
-// ---------------------------------------------------------------------------
-// Per-page fetch — uses Scrape.do if token is configured, otherwise falls
-// back to direct axios requests with proxy + stealth browser fallback.
+// Per-page fetch — direct axios with proxy fallback, then stealth browser
+// for Cloudflare-protected sites.
 // ---------------------------------------------------------------------------
 async function fetchPage(url, blockedHosts = null) {
-  // Route through Scrape.do when token is available
-  if (process.env.SCRAPE_DO_TOKEN) {
-    return fetchPageScrapeDo(url);
-  }
-
   // Fast-path: if this host is already known to be CF-blocked, skip direct+proxy
   if (blockedHosts) {
     const host = new URL(url).hostname;
@@ -532,25 +453,29 @@ function analyzePageHtml(html, url, domain, status, loadTime, pageSizeKb) {
   let internalLinks = 0;
   let externalLinks = 0;
   const discoveredLinks = new Set();
+  const linkDetails = []; // { href, text, type: 'internal' | 'external' }
+  const altDomain = domain.includes("://www.")
+    ? domain.replace("://www.", "://")
+    : domain.replace("://", "://www.");
+
   $("a[href]").each((_, el) => {
     const href = $(el).attr("href") || "";
+    const anchorText = $(el).text().replace(/\s+/g, " ").trim().slice(0, 150) || "";
     try {
       const abs = new URL(href, url).href;
       const clean = cleanUrl(abs);
-      if (clean.startsWith(domain)) {
+      const isInternal = clean.startsWith(domain) || clean.startsWith(altDomain);
+      if (isInternal) {
         internalLinks++;
-        // Follow links unless page declares nofollow — also accept www/non-www variant
+        // Follow links unless page declares nofollow
         if (!isNofollow && isPageUrl(clean)) discoveredLinks.add(clean);
+        if (linkDetails.length < 100) {
+          linkDetails.push({ href: clean, text: anchorText, type: "internal" });
+        }
       } else if (href.startsWith("http")) {
-        // Check if it's a www/non-www variant of our domain
-        const altDomain = domain.includes("://www.")
-          ? domain.replace("://www.", "://")
-          : domain.replace("://", "://www.");
-        if (clean.startsWith(altDomain)) {
-          internalLinks++;
-          if (!isNofollow && isPageUrl(clean)) discoveredLinks.add(clean);
-        } else {
-          externalLinks++;
+        externalLinks++;
+        if (linkDetails.length < 100) {
+          linkDetails.push({ href: abs, text: anchorText, type: "external" });
         }
       }
     } catch {}
@@ -596,7 +521,7 @@ function analyzePageHtml(html, url, domain, status, loadTime, pageSizeKb) {
       title, titleLength, metaDescription, metaLength, canonical,
       isNoindex, isNofollow, h1Count, h2Count, h3Count, h1Text,
       wordCount, totalImages: images.length, missingAlt,
-      internalLinks, externalLinks,
+      internalLinks, externalLinks, linkDetails,
       hasOgTitle, hasOgDescription, hasOgImage, hasSchema, issues,
     },
     links: [...discoveredLinks],
@@ -633,6 +558,7 @@ async function crawlPage(url, domain, stealthPool = null, blockedHosts = null) {
         metaDescription: null, metaLength: 0, canonical: null, isNoindex: false,
         isNofollow: false, h1Count: 0, h2Count: 0, h3Count: 0, h1Text: null,
         wordCount: 0, totalImages: 0, missingAlt: 0, internalLinks: 0, externalLinks: 0,
+        linkDetails: [],
         hasOgTitle: false, hasOgDescription: false, hasOgImage: false, hasSchema: false,
         issues: ["crawl_error"], error: error?.message?.slice(0, 120) || "Unknown error",
       },
