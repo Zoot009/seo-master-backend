@@ -1,6 +1,37 @@
 import * as cheerio from "cheerio";
 import puppeteer from "puppeteer";
 
+// fetch() with AbortSignal timeout — never hangs, never throws
+async function safeFetch(url, options = {}, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Map low-level Puppeteer/network errors to human-readable messages
+function classifyError(err) {
+  const msg = err.message || "";
+  if (msg.includes("ERR_NAME_NOT_RESOLVED") || msg.includes("NS_ERROR_UNKNOWN_HOST"))
+    return "The domain could not be found. Please check the URL and try again.";
+  if (msg.includes("ERR_CONNECTION_REFUSED"))
+    return "The site refused the connection. It may be down or blocking automated access.";
+  if (msg.includes("ERR_CONNECTION_TIMED_OUT") || msg.includes("ETIMEDOUT"))
+    return "The site took too long to respond. Try again later.";
+  if (msg.includes("ERR_SSL") || msg.includes("SSL_ERROR") || msg.includes("certificate"))
+    return "There is an SSL/certificate problem with this site.";
+  if (msg.includes("ERR_TOO_MANY_REDIRECTS"))
+    return "The site has too many redirects and cannot be loaded.";
+  if (msg.includes("ERR_ABORTED") || msg.includes("net::ERR"))
+    return `A network error occurred while loading the page: ${msg}`;
+  return null;
+}
+
 export async function analyzeSEO(url) {
   console.log(`[ANALYZER] Starting analysis for: ${url}`);
   
@@ -8,6 +39,15 @@ export async function analyzeSEO(url) {
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
     url = "https://" + url;
     console.log(`[ANALYZER] Added protocol: ${url}`);
+  }
+
+  // Fast-fail on obviously invalid URLs before launching a browser
+  let urlObj;
+  try {
+    urlObj = new URL(url);
+    if (!urlObj.hostname || urlObj.hostname.length < 3) throw new Error("Invalid hostname");
+  } catch {
+    throw new Error(`Invalid URL: "${url}". Please provide a valid web address.`);
   }
 
   let browser;
@@ -20,70 +60,84 @@ export async function analyzeSEO(url) {
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--disable-extensions",
+        "--disable-background-networking",
         "--single-process",
         "--no-zygote",
+        "--memory-pressure-off",
       ],
+      timeout: 30000,
     });
     console.log(`[ANALYZER] Browser launched successfully`);
 
     const page = await browser.newPage();
 
-    // Block heavy resources we don't need for SEO analysis — speeds up load and reduces hangs
+    // Block heavy resources we don't need for SEO analysis
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       const type = req.resourceType();
-      if (["media", "font", "websocket"].includes(type)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
+      if (["media", "font", "websocket"].includes(type)) req.abort();
+      else req.continue();
     });
+
+    // Silence noisy page-side JS errors so they don't interrupt analysis
+    page.on("console", () => {});
+    page.on("pageerror", () => {});
 
     await page.setViewport({ width: 1920, height: 1080 });
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    );
 
-    // Start timing
     const startTime = Date.now();
 
-    // Navigate — use domcontentloaded so we don't wait forever on ad-heavy pages.
-    // If that resolves but the page's own JS hasn't rendered body yet, fall back to
-    // a short networkidle2 wait capped at 8s.
+    // Navigate with one retry on timeout
     console.log(`[ANALYZER] Navigating to page: ${url}`);
-    try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      // Give JS-rendered content up to 5s to settle
-      await page.waitForNetworkIdle({ timeout: 5000, idleTime: 500 }).catch(() => {});
-    } catch (navErr) {
-      // If navigation itself hard-fails (SSL error, DNS, etc.) rethrow so the
-      // outer catch can return a clean error to the user.
-      if (navErr.message.includes("net::") || navErr.message.includes("ERR_")) {
-        throw new Error(`Could not reach ${url}: ${navErr.message}`);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.waitForNetworkIdle({ timeout: 5000, idleTime: 500 }).catch(() => {});
+        break;
+      } catch (navErr) {
+        const friendly = classifyError(navErr);
+        if (friendly) throw new Error(friendly); // hard network error — don't retry
+        if (attempt === 1) {
+          console.log(`[ANALYZER] Navigation timeout on attempt 1, retrying...`);
+          await new Promise((r) => setTimeout(r, 1500));
+        } else {
+          console.log(`[ANALYZER] Still slow on attempt 2 — proceeding with partial content.`);
+        }
       }
-      // Timeout just means the page was slow — content is likely loaded enough
-      console.log(`[ANALYZER] Navigation timeout (continuing anyway): ${navErr.message}`);
     }
-    console.log(`[ANALYZER] Page loaded successfully`);
-
     const loadTime = Date.now() - startTime;
+    console.log(`[ANALYZER] Page loaded in ${loadTime}ms`);
 
-    // Take desktop screenshot
-    console.log(`[ANALYZER] Taking desktop screenshot...`);
-    const screenshotDesktop = await page.screenshot({
-      encoding: "base64",
-      fullPage: false,
-    });
-
-    // Take mobile screenshot
-    console.log(`[ANALYZER] Taking mobile screenshot...`);
-    await page.setViewport({ width: 360, height: 640 });
-    const screenshotMobile = await page.screenshot({
-      encoding: "base64",
-      fullPage: false,
-    });
+    // Screenshots (non-fatal)
+    let screenshotDesktop = "";
+    let screenshotMobile = "";
+    try {
+      screenshotDesktop = await page.screenshot({ encoding: "base64", fullPage: false });
+      await page.setViewport({ width: 360, height: 640 });
+      screenshotMobile = await page.screenshot({ encoding: "base64", fullPage: false });
+      console.log(`[ANALYZER] Screenshots captured`);
+    } catch (ssErr) {
+      console.warn(`[ANALYZER] Screenshot failed (non-fatal): ${ssErr.message}`);
+    }
 
     // Get HTML content
-    const html = await page.content();
+    let html = "";
+    try {
+      html = await page.content();
+    } catch (htmlErr) {
+      console.warn(`[ANALYZER] Failed to get page content: ${htmlErr.message}`);
+    }
 
-    // Calculate rendering percentage (text content vs HTML size)
+    // Close browser as soon as we have what we need
+    await browser.close();
+    browser = null;
+    console.log(`[ANALYZER] Browser closed`);
+
+    // Parse with Cheerio
     const $ = cheerio.load(html);
     const textContent = $("body").text().replace(/\s+/g, " ").trim();
     const htmlSize = html.length;
@@ -91,12 +145,6 @@ export async function analyzeSEO(url) {
     const renderingPercentage = htmlSize > 0
       ? Math.round((textSize / htmlSize) * 100)
       : 0;
-
-    // Close browser as soon as we have what we need — before the heavy Cheerio work
-    await browser.close();
-    browser = null;
-
-    // Parse with Cheerio (already loaded above)
 
     // Analyze Meta Tags
     let title = $("title").first().text().trim() || "";
@@ -205,7 +253,6 @@ export async function analyzeSEO(url) {
 
     // Analyze Links
     const links = $("a[href]");
-    const urlObj = new URL(url);
     let internalLinks = 0;
     let externalLinks = 0;
 
@@ -227,7 +274,7 @@ export async function analyzeSEO(url) {
 
     // Analyze Content
     const bodyText = $("body").text().replace(/\s+/g, " ").trim();
-    const wordCount = bodyText.split(/\s+/).length;
+    const wordCount = bodyText ? bodyText.split(/\s+/).filter(Boolean).length : 0;
 
     const content = {
       wordCount: wordCount,
@@ -237,25 +284,16 @@ export async function analyzeSEO(url) {
     // Technical SEO
     const isSSL = url.startsWith("https://");
 
-    // Check for robots.txt
+    // Parallel fetch with hard timeouts — robots.txt and sitemap never hang
     const robotsTxtUrl = `${urlObj.protocol}//${urlObj.hostname}/robots.txt`;
-    let hasRobotsTxt = false;
-    try {
-      const robotsResponse = await fetch(robotsTxtUrl, { method: "HEAD" });
-      hasRobotsTxt = robotsResponse.ok;
-    } catch {
-      hasRobotsTxt = false;
-    }
-
-    // Check for sitemap
     const sitemapUrl = `${urlObj.protocol}//${urlObj.hostname}/sitemap.xml`;
-    let hasSitemap = false;
-    try {
-      const sitemapResponse = await fetch(sitemapUrl, { method: "HEAD" });
-      hasSitemap = sitemapResponse.ok;
-    } catch {
-      hasSitemap = false;
-    }
+    const [robotsRes, sitemapRes] = await Promise.all([
+      safeFetch(robotsTxtUrl, { method: "HEAD" }, 6000),
+      safeFetch(sitemapUrl, { method: "HEAD" }, 6000),
+    ]);
+    const hasRobotsTxt = robotsRes ? robotsRes.ok : false;
+    const hasSitemap = sitemapRes ? sitemapRes.ok : false;
+    console.log(`[ANALYZER] robots.txt: ${hasRobotsTxt}, sitemap: ${hasSitemap}`);
 
     // Check for analytics
     const hasGoogleAnalytics = html.includes("google-analytics.com/analytics.js") || 
@@ -1157,16 +1195,15 @@ export async function analyzeSEO(url) {
       });
     }
 
-    console.log(`[ANALYZER] Analysis completed successfully for: ${url}`);
-    console.log(`[ANALYZER] Score: ${score}, Grade: ${grade}`);
+    console.log(`[ANALYZER] Analysis complete: ${url} → Score ${score} (${grade})`);
 
     return {
       url,
       score,
       grade,
       scoreBreakdown,
-      screenshot: `data:image/png;base64,${screenshotDesktop}`,
-      screenshotMobile: `data:image/png;base64,${screenshotMobile}`,
+      screenshot: screenshotDesktop ? `data:image/png;base64,${screenshotDesktop}` : "",
+      screenshotMobile: screenshotMobile ? `data:image/png;base64,${screenshotMobile}` : "",
       title,
       description,
       metaTags,
