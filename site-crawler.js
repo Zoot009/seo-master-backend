@@ -641,10 +641,10 @@ async function takeHomepageScreenshots(url) {
     const page = await browser.newPage();
     await page.setUserAgent(randomUA());
     await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-    await page.setViewport({ width: 1920, height: 1080 });
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.setViewport({ width: 1440, height: 900 });
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
     // Give JS-rendered / CF-challenge pages time to resolve
-    await page.waitForNetworkIdle({ timeout: 8000, idleTime: 800 }).catch(() => {});
+    await page.waitForNetworkIdle({ timeout: 10000, idleTime: 1000 }).catch(() => {});
     // If still on CF challenge, wait for navigation
     const isCF = await page.evaluate(() => {
       const t = document.body?.innerText?.slice(0, 400)?.toLowerCase() ?? "";
@@ -653,11 +653,19 @@ async function takeHomepageScreenshots(url) {
     }).catch(() => false);
     if (isCF) {
       console.log("[CRAWLER] CF challenge on screenshot — waiting for redirect...");
-      await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-      await page.waitForNetworkIdle({ timeout: 6000, idleTime: 800 }).catch(() => {});
+      await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20000 }).catch(() => {});
+      await page.waitForNetworkIdle({ timeout: 8000, idleTime: 1000 }).catch(() => {});
     }
+    // Extra pause to let images/fonts/animations finish rendering
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    // Scroll to trigger lazy-loaded content then scroll back to top
+    await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight); }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await page.evaluate(() => { window.scrollTo(0, 0); }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 800));
     const desktop = await page.screenshot({ encoding: "base64", fullPage: false });
     await page.setViewport({ width: 390, height: 844 });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
     const mobile = await page.screenshot({ encoding: "base64", fullPage: false });
     await browser.close();
     return {
