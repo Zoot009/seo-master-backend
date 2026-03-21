@@ -319,6 +319,62 @@ export async function analyzeSEO(url) {
     let identityType = "";
     let hasLocalBusinessSchema = false;
 
+    // Comprehensive set of all schema.org LocalBusiness types and subtypes
+    const LOCAL_BUSINESS_TYPES = new Set([
+      "LocalBusiness",
+      // Food & Drink
+      "FoodEstablishment", "Restaurant", "Bakery", "BarOrPub", "Brewery",
+      "CafeOrCoffeeShop", "FastFoodRestaurant", "IceCreamShop", "Winery", "Distillery",
+      // Retail Stores
+      "Store", "AutoPartsStore", "BikeStore", "BookStore", "ClothingStore",
+      "ComputerStore", "ConvenienceStore", "DepartmentStore", "ElectronicsStore",
+      "Florist", "FurnitureStore", "GardenStore", "GroceryStore", "HardwareStore",
+      "HobbyShop", "HomeGoodsStore", "JewelryStore", "LiquorStore", "MensClothingStore",
+      "MobilePhoneStore", "MovieRentalStore", "MusicStore", "OfficeEquipmentStore",
+      "OutletStore", "PawnShop", "PetStore", "ShoeStore", "SportingGoodsStore",
+      "TireShop", "ToyStore", "WholesaleStore",
+      // Automotive
+      "AutomotiveBusiness", "AutoBodyShop", "AutoDealer", "AutoRental", "AutoRepair",
+      "AutoWash", "GasStation", "MotorcycleDealer", "MotorcycleRepair",
+      // Medical & Health
+      "MedicalBusiness", "Dentist", "DiagnosticLab", "Hospital", "MedicalClinic",
+      "Optician", "Pharmacy", "Physician", "VeterinaryCare",
+      // Health & Beauty
+      "HealthAndBeautyBusiness", "BeautySalon", "DaySpa", "HairSalon", "HealthClub",
+      "NailSalon", "TattooParlor",
+      // Home & Construction
+      "HomeAndConstructionBusiness", "Electrician", "GeneralContractor", "HVACBusiness",
+      "HousePainter", "Locksmith", "MovingCompany", "Plumber", "RoofingContractor",
+      // Financial
+      "FinancialService", "AccountingService", "AutomatedTeller", "BankOrCreditUnion",
+      "InsuranceAgency",
+      // Legal
+      "LegalService", "Attorney", "Notary",
+      // Lodging
+      "LodgingBusiness", "BedAndBreakfast", "Campground", "Hostel", "Hotel",
+      "Motel", "Resort", "VacationRental",
+      // Entertainment
+      "EntertainmentBusiness", "AmusementPark", "ArtGallery", "Casino",
+      "ComedyClub", "MovieTheater", "NightClub", "AdultEntertainment",
+      // Sports & Recreation
+      "SportsActivityLocation", "BowlingAlley", "ExerciseGym", "GolfCourse",
+      "PublicSwimmingPool", "SkiResort", "SportsClub", "StadiumOrArena", "TennisComplex",
+      // Professional & Services
+      "ProfessionalService", "EmploymentAgency", "RealEstateAgent", "TravelAgency",
+      // Emergency & Government
+      "EmergencyService", "FireStation", "PoliceStation", "GovernmentOffice", "PostOffice",
+      // Other Local
+      "AnimalShelter", "ChildCare", "DryCleaningOrLaundry", "InternetCafe", "Library",
+      "RecyclingCenter", "SelfStorage", "ShoppingCenter", "TouristAttraction",
+      "TouristInformationCenter", "RadioStation",
+    ]);
+
+    // Helper function to normalize a schema @type value (strips namespace prefixes)
+    const normalizeSchemaType = (type) => {
+      // Strip full URL namespaces like "https://schema.org/LocalBusiness" → "LocalBusiness"
+      return type.replace(/^https?:\/\/schema\.org\//i, "").replace(/^schema:/i, "");
+    };
+
     // Helper function to extract schema types recursively
     const extractSchemaTypes = (schema) => {
       if (!schema) return;
@@ -326,30 +382,30 @@ export async function analyzeSEO(url) {
       // Handle @graph array
       if (schema["@graph"] && Array.isArray(schema["@graph"])) {
         schema["@graph"].forEach(item => extractSchemaTypes(item));
-        return;
+        // Don't return early — also process any @type on the root object
       }
       
       // Handle single schema or array of schemas
       if (schema["@type"]) {
         const types = Array.isArray(schema["@type"]) ? schema["@type"] : [schema["@type"]];
         
-        types.forEach(type => {
-          if (type && !schemaTypes.includes(type)) {
+        types.forEach(rawType => {
+          if (!rawType) return;
+          const type = normalizeSchemaType(rawType);
+          if (!schemaTypes.includes(type)) {
             schemaTypes.push(type);
-            
-            // Check for identity schema
-            if (type === "Organization" || type === "Person" || 
-                type === "Corporation" || type === "LocalBusiness") {
-              hasIdentitySchema = true;
-              identityType = type;
-            }
-            
-            // Check for local business schema
-            if (type === "LocalBusiness" || type.includes("LocalBusiness") ||
-                type === "Restaurant" || type === "Store" || 
-                type === "MedicalBusiness" || type === "ProfessionalService") {
-              hasLocalBusinessSchema = true;
-            }
+          }
+          
+          // Check for identity schema
+          if (type === "Organization" || type === "Person" || 
+              type === "Corporation" || type === "LocalBusiness") {
+            hasIdentitySchema = true;
+            identityType = type;
+          }
+          
+          // Check for local business schema using comprehensive type list
+          if (LOCAL_BUSINESS_TYPES.has(type) || type.includes("LocalBusiness")) {
+            hasLocalBusinessSchema = true;
           }
         });
       }
@@ -368,15 +424,38 @@ export async function analyzeSEO(url) {
       });
     };
 
+    // Helper to decode HTML entities that may appear in JSON-LD script content
+    const decodeHtmlEntities = (str) => {
+      return str
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;|&#x27;/g, "'")
+        .replace(/&#x2F;|&#47;/g, "/");
+    };
+
     ldJsonScripts.each((_, el) => {
+      const rawContent = $(el).html();
+      if (!rawContent) return;
+      // Try parsing as-is first; if that fails, try with decoded HTML entities
+      let parsed = null;
       try {
-        const jsonContent = $(el).html();
-        if (jsonContent) {
-          const schema = JSON.parse(jsonContent);
-          extractSchemaTypes(schema);
+        parsed = JSON.parse(rawContent);
+      } catch {
+        try {
+          parsed = JSON.parse(decodeHtmlEntities(rawContent));
+        } catch (error) {
+          console.log('[ANALYZER] Invalid JSON-LD schema:', error.message);
         }
-      } catch (error) {
-        console.log('[ANALYZER] Invalid JSON-LD schema:', error.message);
+      }
+      if (parsed) {
+        // Handle root-level arrays
+        if (Array.isArray(parsed)) {
+          parsed.forEach(item => { if (item && typeof item === 'object') extractSchemaTypes(item); });
+        } else {
+          extractSchemaTypes(parsed);
+        }
       }
     });
     
