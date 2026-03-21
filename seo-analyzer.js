@@ -98,14 +98,25 @@ export async function analyzeSEO(url) {
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
+    // Extra headers to reduce bot detection by aggressive WAFs/firewalls
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+      "Upgrade-Insecure-Requests": "1",
+    });
 
     const startTime = Date.now();
 
     // Navigate with one retry on timeout
     console.log(`[ANALYZER] Navigating to page: ${url}`);
+    let pageHttpStatus = 200;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+        const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+        if (response) pageHttpStatus = response.status();
         await page.waitForNetworkIdle({ timeout: 5000, idleTime: 500 }).catch(() => {});
         break;
       } catch (navErr) {
@@ -119,18 +130,22 @@ export async function analyzeSEO(url) {
       }
     }
     const loadTime = Date.now() - startTime;
-    console.log(`[ANALYZER] Page loaded in ${loadTime}ms`);
+    console.log(`[ANALYZER] Page loaded in ${loadTime}ms (HTTP ${pageHttpStatus})`);
 
-    // Screenshots (non-fatal)
+    // Screenshots (non-fatal) — skip if the site returned an error status (bot blocking, etc.)
     let screenshotDesktop = "";
     let screenshotMobile = "";
-    try {
-      screenshotDesktop = await page.screenshot({ encoding: "base64", fullPage: false });
-      await page.setViewport({ width: 360, height: 640 });
-      screenshotMobile = await page.screenshot({ encoding: "base64", fullPage: false });
-      console.log(`[ANALYZER] Screenshots captured`);
-    } catch (ssErr) {
-      console.warn(`[ANALYZER] Screenshot failed (non-fatal): ${ssErr.message}`);
+    if (pageHttpStatus >= 200 && pageHttpStatus < 400) {
+      try {
+        screenshotDesktop = await page.screenshot({ encoding: "base64", fullPage: false });
+        await page.setViewport({ width: 360, height: 640 });
+        screenshotMobile = await page.screenshot({ encoding: "base64", fullPage: false });
+        console.log(`[ANALYZER] Screenshots captured`);
+      } catch (ssErr) {
+        console.warn(`[ANALYZER] Screenshot failed (non-fatal): ${ssErr.message}`);
+      }
+    } else {
+      console.warn(`[ANALYZER] Skipping screenshots — site returned HTTP ${pageHttpStatus}`);
     }
 
     // Get HTML content
