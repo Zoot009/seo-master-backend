@@ -410,7 +410,10 @@ export async function analyzeSEO(url) {
         });
       }
       
-      // Check nested objects
+      // Capture the first LocalBusiness schema node found (for detailed display)
+    let localBusinessSchemaNode = null;
+
+    // Check nested objects
       Object.values(schema).forEach(value => {
         if (value && typeof value === 'object' && !Array.isArray(value)) {
           extractSchemaTypes(value);
@@ -422,6 +425,111 @@ export async function analyzeSEO(url) {
           });
         }
       });
+    };
+
+    // Extract key fields from a LocalBusiness schema node for rich display
+    const extractLocalBusinessDetails = (node) => {
+      if (!node || typeof node !== 'object') return null;
+
+      const safeStr = (v) => (typeof v === 'string' ? v.trim() : null);
+      const safeArr = (v) => (Array.isArray(v) ? v : v ? [v] : null);
+
+      // Resolve @type
+      const rawType = node['@type'];
+      const schemaType = rawType
+        ? (Array.isArray(rawType) ? rawType.map(t => normalizeSchemaType(t)).join(', ') : normalizeSchemaType(rawType))
+        : null;
+
+      // Address
+      let addressFormatted = null;
+      if (node.address) {
+        if (typeof node.address === 'string') {
+          addressFormatted = node.address;
+        } else if (typeof node.address === 'object') {
+          const a = node.address;
+          const parts = [a.streetAddress, a.addressLocality, a.addressRegion, a.postalCode, a.addressCountry].filter(Boolean);
+          addressFormatted = parts.join(', ') || null;
+        }
+      }
+
+      // Opening hours — can be string, array of strings, or openingHoursSpecification array
+      let openingHours = null;
+      if (node.openingHours) {
+        const raw = safeArr(node.openingHours);
+        if (raw) openingHours = raw.filter(h => typeof h === 'string');
+      }
+      if (!openingHours && node.openingHoursSpecification) {
+        const specs = safeArr(node.openingHoursSpecification);
+        if (specs) {
+          openingHours = specs
+            .filter(s => s && typeof s === 'object' && s.dayOfWeek)
+            .map(s => {
+              const days = Array.isArray(s.dayOfWeek) ? s.dayOfWeek : [s.dayOfWeek];
+              const dayNames = days.map(d => (typeof d === 'string' ? d.replace(/^.*\//, '') : d));
+              const opens = s.opens || '';
+              const closes = s.closes || '';
+              return `${dayNames.join(', ')}: ${opens}–${closes}`;
+            });
+        }
+      }
+
+      // Aggregate rating
+      let aggregateRating = null;
+      if (node.aggregateRating && typeof node.aggregateRating === 'object') {
+        const r = node.aggregateRating;
+        aggregateRating = {
+          ratingValue: safeStr(String(r.ratingValue ?? '')),
+          reviewCount: safeStr(String(r.reviewCount ?? r.ratingCount ?? '')),
+          bestRating: safeStr(String(r.bestRating ?? '5')),
+        };
+      }
+
+      return {
+        schemaType,
+        name: safeStr(node.name),
+        description: safeStr(node.description),
+        url: safeStr(node.url),
+        telephone: safeStr(node.telephone),
+        email: safeStr(node.email),
+        address: addressFormatted,
+        priceRange: safeStr(node.priceRange),
+        image: typeof node.image === 'string' ? node.image : (node.image?.url || null),
+        openingHours: openingHours && openingHours.length > 0 ? openingHours : null,
+        aggregateRating,
+        sameAs: Array.isArray(node.sameAs) ? node.sameAs.filter(s => typeof s === 'string') : (node.sameAs ? [node.sameAs] : null),
+      };
+    };
+
+    // Walk a parsed schema tree and return the first LocalBusiness-type node found
+    const findFirstLocalBusinessNode = (schema) => {
+      if (!schema || typeof schema !== 'object') return null;
+      if (schema['@graph'] && Array.isArray(schema['@graph'])) {
+        for (const item of schema['@graph']) {
+          const found = findFirstLocalBusinessNode(item);
+          if (found) return found;
+        }
+      }
+      if (Array.isArray(schema)) {
+        for (const item of schema) {
+          const found = findFirstLocalBusinessNode(item);
+          if (found) return found;
+        }
+        return null;
+      }
+      if (schema['@type']) {
+        const types = Array.isArray(schema['@type']) ? schema['@type'] : [schema['@type']];
+        if (types.some(t => LOCAL_BUSINESS_TYPES.has(normalizeSchemaType(t)) || normalizeSchemaType(t).includes('LocalBusiness'))) {
+          return schema;
+        }
+      }
+      // Check nested values
+      for (const value of Object.values(schema)) {
+        if (value && typeof value === 'object') {
+          const found = findFirstLocalBusinessNode(value);
+          if (found) return found;
+        }
+      }
+      return null;
     };
 
     // Helper to decode HTML entities that may appear in JSON-LD script content
@@ -455,6 +563,11 @@ export async function analyzeSEO(url) {
           parsed.forEach(item => { if (item && typeof item === 'object') extractSchemaTypes(item); });
         } else {
           extractSchemaTypes(parsed);
+        }
+        // Capture the first LocalBusiness node seen across all scripts
+        if (!localBusinessSchemaNode) {
+          const node = findFirstLocalBusinessNode(parsed);
+          if (node) localBusinessSchemaNode = node;
         }
       }
     });
@@ -1111,6 +1224,7 @@ export async function analyzeSEO(url) {
       phoneNumber,
       hasAddress,
       addressText,
+      localBusinessSchemaData: localBusinessSchemaNode ? extractLocalBusinessDetails(localBusinessSchemaNode) : null,
     };
 
     // Generate Recommendations
