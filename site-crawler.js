@@ -366,7 +366,22 @@ async function getSeedUrls(baseUrl, maxPages = 500) {
 // Per-page fetch — direct axios with proxy fallback, then stealth browser
 // for Cloudflare-protected sites.
 // ---------------------------------------------------------------------------
-async function fetchPage(url, blockedHosts = null) {
+async function fetchPage(url, blockedHosts = null, useScrapeDo = false) {
+  // Use Scrape.do API when requested
+  if (useScrapeDo) {
+    const token = process.env.SCRAPE_DO_TOKEN;
+    if (!token) throw new Error('SCRAPE_DO_TOKEN is not configured');
+    const start = Date.now();
+    const params = new URLSearchParams({ token, url, render: 'true' });
+    const response = await axios.get(`https://api.scrape.do?${params}`, {
+      timeout: 30000,
+      validateStatus: () => true,
+    });
+    const html = typeof response.data === 'string' ? response.data : String(response.data);
+    const loadTime = ((Date.now() - start) / 1000).toFixed(2);
+    return { response, loadTime, html, wasBlocked: false };
+  }
+
   // Fast-path: if this host is already known to be CF-blocked, skip direct+proxy
   if (blockedHosts) {
     const host = new URL(url).hostname;
@@ -529,8 +544,8 @@ function analyzePageHtml(html, url, domain, status, loadTime, pageSizeKb) {
 }
 
 /** Fetch + analyze a single page, returns { page, links } */
-async function crawlPage(url, domain, stealthPool = null, blockedHosts = null) {
-  let { response, loadTime, html, error, wasBlocked } = await fetchPage(url, blockedHosts);
+async function crawlPage(url, domain, stealthPool = null, blockedHosts = null, useScrapeDo = false) {
+  let { response, loadTime, html, error, wasBlocked } = await fetchPage(url, blockedHosts, useScrapeDo);
 
   // If direct + proxy both blocked/failed, use stealth browser (handles CF JS challenges)
   if (stealthPool && wasBlocked) {
@@ -702,16 +717,16 @@ export async function crawlSite(baseUrl, options = {}) {
     concurrency = 5,
     maxPages = 500,
     onProgress = null,
+    useScrapeDo = !!process.env.SCRAPE_DO_TOKEN,
   } = options;
 
   baseUrl = normalizeUrl(baseUrl);
   const domain = getDomain(baseUrl);
-  const usingScrapeDo = !!process.env.SCRAPE_DO_TOKEN;
-  console.log(`[CRAWLER] Starting crawl: ${baseUrl} (concurrency=${concurrency}, maxPages=${maxPages}, via=${usingScrapeDo ? 'scrape.do' : 'direct'})`);
+  console.log(`[CRAWLER] Starting crawl: ${baseUrl} (concurrency=${concurrency}, maxPages=${maxPages}, via=${useScrapeDo ? 'scrape.do' : 'direct'})`);
 
   // Stealth pool only needed when NOT using Scrape.do
-  const stealthPool = usingScrapeDo ? null : new StealthBrowserPool(Math.min(concurrency, 10), getProxyConfig());
-  const blockedHosts = usingScrapeDo ? null : new Set();
+  const stealthPool = useScrapeDo ? null : new StealthBrowserPool(Math.min(concurrency, 10), getProxyConfig());
+  const blockedHosts = useScrapeDo ? null : new Set();
 
   // Step 0: Screenshot runs in parallel with URL discovery
   const screenshotPromise = takeHomepageScreenshots(baseUrl);
@@ -723,7 +738,7 @@ export async function crawlSite(baseUrl, options = {}) {
   // Step 2: Fetch homepage and extract internal links to fill gaps
   if (urlSet.size < maxPages) {
     console.log(`[CRAWLER] Fetching homepage to discover additional links...`);
-    const homeFetch = await fetchPage(baseUrl, blockedHosts);
+    const homeFetch = await fetchPage(baseUrl, blockedHosts, useScrapeDo);
     if (homeFetch.html) {
       const $ = cheerio.load(homeFetch.html);
       $('a[href]').each((_, el) => {
@@ -750,14 +765,14 @@ export async function crawlSite(baseUrl, options = {}) {
   const results = [];
   let cursor = 0;
   // Small inter-request delay per worker to avoid hammering Scrape.do
-  const INTER_REQUEST_DELAY_MS = process.env.SCRAPE_DO_TOKEN ? 150 : 0;
+  const INTER_REQUEST_DELAY_MS = useScrapeDo ? 150 : 0;
 
   const worker = async () => {
     while (true) {
       const idx = cursor++;
       if (idx >= allUrls.length) break;
       const url = allUrls[idx];
-      const { page } = await crawlPage(url, domain, stealthPool, blockedHosts);
+      const { page } = await crawlPage(url, domain, stealthPool, blockedHosts, useScrapeDo);
       results.push(page);
       const done = results.length;
       console.log(`[CRAWLER] Progress: ${done}/${total}`);

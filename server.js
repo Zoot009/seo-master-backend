@@ -435,7 +435,7 @@ app.post('/api/generate-pdf', authenticateApiKey, async (req, res) => {
 // Site Crawl endpoint — discovers and audits every page on a website
 app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
   const url = validateHttpUrl(req.body.url);
-  const { concurrency, maxPages } = req.body;
+  const { concurrency, maxPages, crawler } = req.body;
 
   if (!url) {
     return res.status(400).json({ error: 'A valid public http:// or https:// URL is required' });
@@ -465,6 +465,7 @@ app.post('/api/crawl-site', authenticateApiKey, async (req, res) => {
     const options = {
       concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : 15,
       maxPages: Math.min(typeof maxPages === 'number' && maxPages > 0 ? maxPages : 500, 500),
+      useScrapeDo: crawler === 'scrapedo',
     };
 
     console.log(`[BACKEND] Starting site crawl for: ${url}`);
