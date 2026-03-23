@@ -42,125 +42,7 @@ function classifyError(err) {
   // Not a site-specific error — caller handles it (timeout, etc.)
 }
 
-export async function analyzeSEO(url) {
-  console.log(`[ANALYZER] Starting analysis for: ${url}`);
-  
-  // Ensure URL has protocol
-  if (!url.startsWith("http://") && !url.startsWith("https://")) {
-    url = "https://" + url;
-    console.log(`[ANALYZER] Added protocol: ${url}`);
-  }
-
-  // Fast-fail on obviously invalid URLs before launching a browser
-  let urlObj;
-  try {
-    urlObj = new URL(url);
-    if (!urlObj.hostname || urlObj.hostname.length < 3) throw new Error("Invalid hostname");
-  } catch {
-    throw new Error(`Invalid URL: "${url}". Please provide a valid web address.`);
-  }
-
-  let browser;
-  try {
-    console.log(`[ANALYZER] Launching Puppeteer browser...`);
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--single-process",
-        "--no-zygote",
-        "--memory-pressure-off",
-      ],
-      timeout: 30000,
-    });
-    console.log(`[ANALYZER] Browser launched successfully`);
-
-    const page = await browser.newPage();
-
-    // Block heavy resources we don't need for SEO analysis
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      const type = req.resourceType();
-      if (["media", "font", "websocket"].includes(type)) req.abort();
-      else req.continue();
-    });
-
-    // Silence noisy page-side JS errors so they don't interrupt analysis
-    page.on("console", () => {});
-    page.on("pageerror", () => {});
-
-    await page.setViewport({ width: 1920, height: 1080 });
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    );
-    // Extra headers to reduce bot detection by aggressive WAFs/firewalls
-    await page.setExtraHTTPHeaders({
-      "Accept-Language": "en-US,en;q=0.9",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-      "sec-ch-ua-mobile": "?0",
-      "sec-ch-ua-platform": '"Windows"',
-      "Upgrade-Insecure-Requests": "1",
-    });
-
-    const startTime = Date.now();
-
-    // Navigate with one retry on timeout
-    console.log(`[ANALYZER] Navigating to page: ${url}`);
-    let pageHttpStatus = 200;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-        if (response) pageHttpStatus = response.status();
-        await page.waitForNetworkIdle({ timeout: 5000, idleTime: 500 }).catch(() => {});
-        break;
-      } catch (navErr) {
-        classifyError(navErr); // throws SiteError if it's a site-specific failure
-        if (attempt === 1) {
-          console.log(`[ANALYZER] Navigation timeout on attempt 1, retrying...`);
-          await new Promise((r) => setTimeout(r, 1500));
-        } else {
-          console.log(`[ANALYZER] Still slow on attempt 2 — proceeding with partial content.`);
-        }
-      }
-    }
-    const loadTime = Date.now() - startTime;
-    console.log(`[ANALYZER] Page loaded in ${loadTime}ms (HTTP ${pageHttpStatus})`);
-
-    // Screenshots (non-fatal) — skip if the site returned an error status (bot blocking, etc.)
-    let screenshotDesktop = "";
-    let screenshotMobile = "";
-    if (pageHttpStatus >= 200 && pageHttpStatus < 400) {
-      try {
-        screenshotDesktop = await page.screenshot({ encoding: "base64", fullPage: false });
-        await page.setViewport({ width: 360, height: 640 });
-        screenshotMobile = await page.screenshot({ encoding: "base64", fullPage: false });
-        console.log(`[ANALYZER] Screenshots captured`);
-      } catch (ssErr) {
-        console.warn(`[ANALYZER] Screenshot failed (non-fatal): ${ssErr.message}`);
-      }
-    } else {
-      console.warn(`[ANALYZER] Skipping screenshots — site returned HTTP ${pageHttpStatus}`);
-    }
-
-    // Get HTML content
-    let html = "";
-    try {
-      html = await page.content();
-    } catch (htmlErr) {
-      console.warn(`[ANALYZER] Failed to get page content: ${htmlErr.message}`);
-    }
-
-    // Close browser as soon as we have what we need
-    await browser.close();
-    browser = null;
-    console.log(`[ANALYZER] Browser closed`);
-
+async function _runCheerioPipeline(url, urlObj, html, screenshotDesktop, screenshotMobile, loadTime) {
     // Parse with Cheerio
     const $ = cheerio.load(html);
     const textContent = $("body").text().replace(/\s+/g, " ").trim();
@@ -425,10 +307,7 @@ export async function analyzeSEO(url) {
         });
       }
       
-      // Capture the first LocalBusiness schema node found (for detailed display)
-    let localBusinessSchemaNode = null;
-
-    // Check nested objects
+      // Check nested objects
       Object.values(schema).forEach(value => {
         if (value && typeof value === 'object' && !Array.isArray(value)) {
           extractSchemaTypes(value);
@@ -440,111 +319,6 @@ export async function analyzeSEO(url) {
           });
         }
       });
-    };
-
-    // Extract key fields from a LocalBusiness schema node for rich display
-    const extractLocalBusinessDetails = (node) => {
-      if (!node || typeof node !== 'object') return null;
-
-      const safeStr = (v) => (typeof v === 'string' ? v.trim() : null);
-      const safeArr = (v) => (Array.isArray(v) ? v : v ? [v] : null);
-
-      // Resolve @type
-      const rawType = node['@type'];
-      const schemaType = rawType
-        ? (Array.isArray(rawType) ? rawType.map(t => normalizeSchemaType(t)).join(', ') : normalizeSchemaType(rawType))
-        : null;
-
-      // Address
-      let addressFormatted = null;
-      if (node.address) {
-        if (typeof node.address === 'string') {
-          addressFormatted = node.address;
-        } else if (typeof node.address === 'object') {
-          const a = node.address;
-          const parts = [a.streetAddress, a.addressLocality, a.addressRegion, a.postalCode, a.addressCountry].filter(Boolean);
-          addressFormatted = parts.join(', ') || null;
-        }
-      }
-
-      // Opening hours — can be string, array of strings, or openingHoursSpecification array
-      let openingHours = null;
-      if (node.openingHours) {
-        const raw = safeArr(node.openingHours);
-        if (raw) openingHours = raw.filter(h => typeof h === 'string');
-      }
-      if (!openingHours && node.openingHoursSpecification) {
-        const specs = safeArr(node.openingHoursSpecification);
-        if (specs) {
-          openingHours = specs
-            .filter(s => s && typeof s === 'object' && s.dayOfWeek)
-            .map(s => {
-              const days = Array.isArray(s.dayOfWeek) ? s.dayOfWeek : [s.dayOfWeek];
-              const dayNames = days.map(d => (typeof d === 'string' ? d.replace(/^.*\//, '') : d));
-              const opens = s.opens || '';
-              const closes = s.closes || '';
-              return `${dayNames.join(', ')}: ${opens}–${closes}`;
-            });
-        }
-      }
-
-      // Aggregate rating
-      let aggregateRating = null;
-      if (node.aggregateRating && typeof node.aggregateRating === 'object') {
-        const r = node.aggregateRating;
-        aggregateRating = {
-          ratingValue: safeStr(String(r.ratingValue ?? '')),
-          reviewCount: safeStr(String(r.reviewCount ?? r.ratingCount ?? '')),
-          bestRating: safeStr(String(r.bestRating ?? '5')),
-        };
-      }
-
-      return {
-        schemaType,
-        name: safeStr(node.name),
-        description: safeStr(node.description),
-        url: safeStr(node.url),
-        telephone: safeStr(node.telephone),
-        email: safeStr(node.email),
-        address: addressFormatted,
-        priceRange: safeStr(node.priceRange),
-        image: typeof node.image === 'string' ? node.image : (node.image?.url || null),
-        openingHours: openingHours && openingHours.length > 0 ? openingHours : null,
-        aggregateRating,
-        sameAs: Array.isArray(node.sameAs) ? node.sameAs.filter(s => typeof s === 'string') : (node.sameAs ? [node.sameAs] : null),
-      };
-    };
-
-    // Walk a parsed schema tree and return the first LocalBusiness-type node found
-    const findFirstLocalBusinessNode = (schema) => {
-      if (!schema || typeof schema !== 'object') return null;
-      if (schema['@graph'] && Array.isArray(schema['@graph'])) {
-        for (const item of schema['@graph']) {
-          const found = findFirstLocalBusinessNode(item);
-          if (found) return found;
-        }
-      }
-      if (Array.isArray(schema)) {
-        for (const item of schema) {
-          const found = findFirstLocalBusinessNode(item);
-          if (found) return found;
-        }
-        return null;
-      }
-      if (schema['@type']) {
-        const types = Array.isArray(schema['@type']) ? schema['@type'] : [schema['@type']];
-        if (types.some(t => LOCAL_BUSINESS_TYPES.has(normalizeSchemaType(t)) || normalizeSchemaType(t).includes('LocalBusiness'))) {
-          return schema;
-        }
-      }
-      // Check nested values
-      for (const value of Object.values(schema)) {
-        if (value && typeof value === 'object') {
-          const found = findFirstLocalBusinessNode(value);
-          if (found) return found;
-        }
-      }
-      return null;
     };
 
     // Helper to decode HTML entities that may appear in JSON-LD script content
@@ -578,11 +352,6 @@ export async function analyzeSEO(url) {
           parsed.forEach(item => { if (item && typeof item === 'object') extractSchemaTypes(item); });
         } else {
           extractSchemaTypes(parsed);
-        }
-        // Capture the first LocalBusiness node seen across all scripts
-        if (!localBusinessSchemaNode) {
-          const node = findFirstLocalBusinessNode(parsed);
-          if (node) localBusinessSchemaNode = node;
         }
       }
     });
@@ -1239,7 +1008,7 @@ export async function analyzeSEO(url) {
       phoneNumber,
       hasAddress,
       addressText,
-      localBusinessSchemaData: localBusinessSchemaNode ? extractLocalBusinessDetails(localBusinessSchemaNode) : null,
+      localBusinessSchemaData: null,
     };
 
     // Generate Recommendations
@@ -1419,8 +1188,12 @@ export async function analyzeSEO(url) {
       score,
       grade,
       scoreBreakdown,
-      screenshot: screenshotDesktop ? `data:image/png;base64,${screenshotDesktop}` : "",
-      screenshotMobile: screenshotMobile ? `data:image/png;base64,${screenshotMobile}` : "",
+      screenshot: screenshotDesktop
+        ? (screenshotDesktop.startsWith('data:') ? screenshotDesktop : `data:image/png;base64,${screenshotDesktop}`)
+        : "",
+      screenshotMobile: screenshotMobile
+        ? (screenshotMobile.startsWith('data:') ? screenshotMobile : `data:image/png;base64,${screenshotMobile}`)
+        : "",
       title,
       description,
       metaTags,
@@ -1435,13 +1208,131 @@ export async function analyzeSEO(url) {
       localSEO,
       recommendations,
     };
-  } catch (error) {
-    console.error(`[ANALYZER] ERROR analyzing SEO for ${url}:`, error);
-    console.error(`[ANALYZER] Error details:`, {
-      message: error.message,
-      stack: error.stack,
-      name: error.name,
+}
+
+export async function analyzeSEO(url) {
+  console.log(`[ANALYZER] Starting analysis for: ${url}`);
+  
+  // Ensure URL has protocol
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
+    console.log(`[ANALYZER] Added protocol: ${url}`);
+  }
+
+  // Fast-fail on obviously invalid URLs before launching a browser
+  let urlObj;
+  try {
+    urlObj = new URL(url);
+    if (!urlObj.hostname || urlObj.hostname.length < 3) throw new Error("Invalid hostname");
+  } catch {
+    throw new Error(`Invalid URL: "${url}". Please provide a valid web address.`);
+  }
+
+  let browser;
+  try {
+    console.log(`[ANALYZER] Launching Puppeteer browser...`);
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--single-process",
+        "--no-zygote",
+        "--memory-pressure-off",
+      ],
+      timeout: 30000,
     });
+    console.log(`[ANALYZER] Browser launched successfully`);
+
+    const page = await browser.newPage();
+
+    // Block heavy resources we don't need for SEO analysis
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const type = req.resourceType();
+      if (["media", "font", "websocket"].includes(type)) req.abort();
+      else req.continue();
+    });
+
+    // Silence noisy page-side JS errors so they don't interrupt analysis
+    page.on("console", () => {});
+    page.on("pageerror", () => {});
+
+    await page.setViewport({ width: 1920, height: 1080 });
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    );
+    // Extra headers to reduce bot detection by aggressive WAFs/firewalls
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+      "Upgrade-Insecure-Requests": "1",
+    });
+
+    const startTime = Date.now();
+
+    // Navigate with one retry on timeout
+    console.log(`[ANALYZER] Navigating to page: ${url}`);
+    let pageHttpStatus = 200;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+        if (response) pageHttpStatus = response.status();
+        await page.waitForNetworkIdle({ timeout: 5000, idleTime: 500 }).catch(() => {});
+        break;
+      } catch (navErr) {
+        classifyError(navErr); // throws SiteError if it's a site-specific failure
+        if (attempt === 1) {
+          console.log(`[ANALYZER] Navigation timeout on attempt 1, retrying...`);
+          await new Promise((r) => setTimeout(r, 1500));
+        } else {
+          console.log(`[ANALYZER] Still slow on attempt 2 — proceeding with partial content.`);
+        }
+      }
+    }
+    const loadTime = Date.now() - startTime;
+    console.log(`[ANALYZER] Page loaded in ${loadTime}ms (HTTP ${pageHttpStatus})`);
+
+    // Screenshots (non-fatal) — skip if the site returned an error status (bot blocking, etc.)
+    let screenshotDesktop = "";
+    let screenshotMobile = "";
+    if (pageHttpStatus >= 200 && pageHttpStatus < 400) {
+      try {
+        screenshotDesktop = await page.screenshot({ encoding: "base64", fullPage: false });
+        await page.setViewport({ width: 360, height: 640 });
+        screenshotMobile = await page.screenshot({ encoding: "base64", fullPage: false });
+        console.log(`[ANALYZER] Screenshots captured`);
+      } catch (ssErr) {
+        console.warn(`[ANALYZER] Screenshot failed (non-fatal): ${ssErr.message}`);
+      }
+    } else {
+      console.warn(`[ANALYZER] Skipping screenshots — site returned HTTP ${pageHttpStatus}`);
+    }
+
+    // Get HTML content
+    let html = "";
+    try {
+      html = await page.content();
+    } catch (htmlErr) {
+      console.warn(`[ANALYZER] Failed to get page content: ${htmlErr.message}`);
+    }
+
+    // Close browser as soon as we have what we need
+    await browser.close();
+    browser = null;
+    console.log(`[ANALYZER] Browser closed`);
+
+
+    return await _runCheerioPipeline(url, urlObj, html, screenshotDesktop, screenshotMobile, loadTime);
+  } catch (error) {
+    console.error(`[ANALYZER] ERROR analyzing SEO for ${url}:`, error.message);
     throw error;
   } finally {
     if (browser) {
@@ -1453,4 +1344,23 @@ export async function analyzeSEO(url) {
       }
     }
   }
+}
+
+// Analyze SEO from pre-fetched HTML (e.g. via scrape.do)
+export async function analyzeSEOFromHTML(url, html, screenshotDesktop = "", screenshotMobile = "") {
+  console.log(`[ANALYZER] Starting HTML-based analysis for: ${url}`);
+
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
+  }
+
+  let urlObj;
+  try {
+    urlObj = new URL(url);
+    if (!urlObj.hostname || urlObj.hostname.length < 3) throw new Error("Invalid hostname");
+  } catch {
+    throw new Error(`Invalid URL: "${url}". Please provide a valid web address.`);
+  }
+
+  return await _runCheerioPipeline(url, urlObj, html, screenshotDesktop, screenshotMobile, 0);
 }

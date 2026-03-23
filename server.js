@@ -24,7 +24,7 @@ import puppeteer from 'puppeteer';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pkg from 'pg';
-import { analyzeSEO } from './seo-analyzer.js';
+import { analyzeSEO, analyzeSEOFromHTML } from './seo-analyzer.js';
 import { validateSchema } from './schema-validator.js';
 import { generatePDF } from './pdf-generator.js';
 import { crawlSite } from './site-crawler.js';
@@ -192,13 +192,116 @@ app.get('/health', (req, res) => {
 
 // SEO Analysis endpoint (auth required)
 app.post('/api/analyze', authenticateApiKey, async (req, res) => {
-  const { url: rawUrl, reportId } = req.body;
+  const { url: rawUrl, reportId, crawler } = req.body;
   const url = validateHttpUrl(rawUrl);
 
   if (!url) {
     return res.status(400).json({ error: 'A valid public http:// or https:// URL is required' });
   }
 
+  // ── Scrape.do path ──────────────────────────────────────────────────────────
+  if (crawler === 'scrapedo') {
+    const scrapeDoToken = process.env.SCRAPE_DO_TOKEN;
+    if (!scrapeDoToken) {
+      return res.status(500).json({
+        success: false,
+        error: 'Scrape.do credentials are not configured. Please add SCRAPE_DO_TOKEN to the backend environment.',
+        reportId,
+      });
+    }
+
+    console.log(`[BACKEND] Starting scrape.do analysis for: ${url} (Report ID: ${reportId || 'N/A'})`);
+
+    try {
+      await analysisSemaphore.acquire();
+    } catch (queueErr) {
+      console.warn(`[BACKEND] Queue rejected: ${queueErr.message}`);
+      return res.status(503).json({ success: false, error: queueErr.message, reportId });
+    }
+
+    const ANALYSIS_TIMEOUT_MS = parseInt(process.env.ANALYSIS_TIMEOUT_MS || "90000", 10);
+    let released = false;
+    const release = () => { if (!released) { released = true; analysisSemaphore.release(); } };
+
+    const timeoutHandle = setTimeout(() => {
+      release();
+      if (!res.headersSent) {
+        res.status(504).json({ success: false, error: 'Scrape.do analysis timed out.', reportId });
+      }
+    }, ANALYSIS_TIMEOUT_MS);
+
+    try {
+      const baseParams = new URLSearchParams({ token: scrapeDoToken, url, render: 'true' });
+
+      // Fetch HTML
+      const htmlRes = await fetch(`https://api.scrape.do?${baseParams}`);
+      if (!htmlRes.ok) {
+        throw new Error(`Scrape.do returned HTTP ${htmlRes.status}`);
+      }
+      const html = await htmlRes.text();
+      console.log(`[BACKEND] scrape.do HTML fetched, size: ${html.length} bytes`);
+
+      // Fetch a screenshot from scrape.do; returns full data URI or '' on failure
+      // Note: screenshot=true already implies JS rendering — adding render=true causes a 400
+      const fetchScrapeDoScreenshot = async (extraParams = {}) => {
+        try {
+          const params = new URLSearchParams({ token: scrapeDoToken, url, screenshot: 'true', ...extraParams });
+          const ssRes = await fetch(`https://api.scrape.do?${params}`);
+          if (!ssRes.ok) {
+            const errBody = await ssRes.text().catch(() => '(unreadable)');
+            console.warn(`[BACKEND] scrape.do screenshot HTTP ${ssRes.status}: ${errBody.slice(0, 200)}`);
+            return '';
+          }
+          const contentType = ssRes.headers.get('content-type') || '';
+          const mime = contentType.split(';')[0].trim();
+          if (!mime.startsWith('image/')) {
+            const body = await ssRes.text();
+            console.warn(`[BACKEND] scrape.do screenshot non-image (${mime || 'no content-type'}): ${body.slice(0, 200)}`);
+            return '';
+          }
+          const buf = await ssRes.arrayBuffer();
+          console.log(`[BACKEND] scrape.do screenshot OK (${mime}, ${buf.byteLength} bytes)`);
+          return `data:${mime};base64,${Buffer.from(buf).toString('base64')}`;
+        } catch (err) {
+          console.warn(`[BACKEND] scrape.do screenshot error: ${err.message}`);
+          return '';
+        }
+      };
+
+      // Fetch desktop + mobile screenshots in parallel
+      // scrape.do uses `width` for mobile viewport (390 = iPhone), not device=mobile
+      const [screenshotDesktop, screenshotMobile] = await Promise.all([
+        fetchScrapeDoScreenshot(),
+        fetchScrapeDoScreenshot({ width: '390' }),
+      ]);
+
+      console.log(`[BACKEND] Screenshots: desktop=${screenshotDesktop ? 'OK' : 'empty'}, mobile=${screenshotMobile ? 'OK' : 'empty'}`);
+
+      const result = await analyzeSEOFromHTML(url, html, screenshotDesktop, screenshotMobile);
+      clearTimeout(timeoutHandle);
+      release();
+      console.log(`[BACKEND] scrape.do analysis completed for: ${url}`);
+
+      if (!res.headersSent) {
+        res.json({ success: true, data: result, reportId });
+      }
+    } catch (error) {
+      clearTimeout(timeoutHandle);
+      release();
+      console.error('[BACKEND] Scrape.do analysis error:', error.message);
+      if (!res.headersSent) {
+        const statusCode = error.name === 'SiteError' ? 422 : 500;
+        res.status(statusCode).json({
+          success: false,
+          error: error.message || 'Failed to analyze website via scrape.do',
+          reportId,
+        });
+      }
+    }
+    return;
+  }
+
+  // ── Default Puppeteer path ───────────────────────────────────────────────────
   console.log(`[BACKEND] Queuing SEO analysis for: ${url} (active=${analysisSemaphore.active}, queued=${analysisSemaphore.queued})`);
 
   try {
