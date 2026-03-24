@@ -388,17 +388,17 @@ async function _runCheerioPipeline(url, urlObj, html, screenshotDesktop, screens
     let linkedInUrl = "";
     let youTubeUrl = "";
 
-    $("a[href]").each((_, el) => {
-      const href = $(el).attr("href") || "";
-      
-      if (href.includes("facebook.com/") && !facebookUrl) {
+    // Helper to apply a candidate URL to the right social variable
+    const applySocialUrl = (href) => {
+      if (!href || typeof href !== "string") return;
+      if ((href.includes("facebook.com/") || href.includes("fb.com/") || href.includes("fb.me/")) && !facebookUrl) {
         facebookUrl = href;
       }
       if (href.includes("instagram.com/") && !instagramUrl) {
         instagramUrl = href;
       }
-      if (href.includes("twitter.com/") || href.includes("x.com/")) {
-        if (!twitterUrl) twitterUrl = href;
+      if ((href.includes("twitter.com/") || href.includes("x.com/")) && !twitterUrl) {
+        twitterUrl = href;
       }
       if (href.includes("linkedin.com/") && !linkedInUrl) {
         linkedInUrl = href;
@@ -406,11 +406,83 @@ async function _runCheerioPipeline(url, urlObj, html, screenshotDesktop, screens
       if (href.includes("youtube.com/") && !youTubeUrl) {
         youTubeUrl = href;
       }
+    };
+
+    // Method 1: <a href> tags (primary)
+    $("a[href]").each((_, el) => {
+      applySocialUrl($(el).attr("href") || "");
     });
 
+    // Method 2: og:url meta tag (Facebook-specific fallback)
     const ogFacebook = $('meta[property="og:url"]').attr("content") || "";
     if (ogFacebook.includes("facebook.com/") && !facebookUrl) {
       facebookUrl = ogFacebook;
+    }
+
+    // Method 3: JSON-LD sameAs property (many SEO-conscious sites use this)
+    ldJsonScripts.each((_, el) => {
+      const rawContent = $(el).html();
+      if (!rawContent) return;
+      let parsed = null;
+      try {
+        parsed = JSON.parse(rawContent);
+      } catch {
+        try {
+          parsed = JSON.parse(decodeHtmlEntities(rawContent));
+        } catch { return; }
+      }
+      if (!parsed) return;
+
+      const extractSameAs = (schema) => {
+        if (!schema || typeof schema !== "object") return;
+        if (Array.isArray(schema)) { schema.forEach(extractSameAs); return; }
+        const sameAs = schema.sameAs;
+        if (sameAs) {
+          const urls = Array.isArray(sameAs) ? sameAs : [sameAs];
+          urls.forEach(u => { if (typeof u === "string") applySocialUrl(u); });
+        }
+        if (schema["@graph"] && Array.isArray(schema["@graph"])) {
+          schema["@graph"].forEach(extractSameAs);
+        }
+        Object.values(schema).forEach(v => {
+          if (v && typeof v === "object") extractSameAs(v);
+        });
+      };
+
+      if (Array.isArray(parsed)) {
+        parsed.forEach(extractSameAs);
+      } else {
+        extractSameAs(parsed);
+      }
+    });
+
+    // Method 4: data-href attributes (Facebook Like/Share widgets)
+    $("[data-href]").each((_, el) => {
+      applySocialUrl($(el).attr("data-href") || "");
+    });
+
+    // Method 5: Raw HTML regex fallback — catches onclick handlers, JS vars, etc.
+    if (!facebookUrl || !instagramUrl || !twitterUrl || !linkedInUrl || !youTubeUrl) {
+      const rawHtml = $.html();
+      const fallbackPatterns = [
+        { key: "facebook",  regex: /https?:\/\/(?:www\.)?(?:facebook\.com|fb\.com|fb\.me)\/(?!sharer|dialog\/share|plugins)[^\s"'<>\]\\)]+/i },
+        { key: "instagram", regex: /https?:\/\/(?:www\.)?instagram\.com\/(?!p\/|reel\/|explore\/)[^\s"'<>\]\\)]+/i },
+        { key: "twitter",   regex: /https?:\/\/(?:www\.)?(?:twitter|x)\.com\/(?!intent\/|share\?)[^\s"'<>\]\\)]+/i },
+        { key: "linkedin",  regex: /https?:\/\/(?:www\.)?linkedin\.com\/(?:company|in)\/[^\s"'<>\]\\)]+/i },
+        { key: "youtube",   regex: /https?:\/\/(?:www\.)?youtube\.com\/(?:channel\/|c\/|@)[^\s"'<>\]\\)]+/i },
+      ];
+      for (const { key, regex } of fallbackPatterns) {
+        const alreadyFound =
+          (key === "facebook"  && facebookUrl)  ||
+          (key === "instagram" && instagramUrl) ||
+          (key === "twitter"   && twitterUrl)   ||
+          (key === "linkedin"  && linkedInUrl)  ||
+          (key === "youtube"   && youTubeUrl);
+        if (!alreadyFound) {
+          const match = rawHtml.match(regex);
+          if (match) applySocialUrl(match[0]);
+        }
+      }
     }
 
     const hasFacebookPage = facebookUrl.length > 0;
