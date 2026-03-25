@@ -123,20 +123,31 @@ const dbPool = new Pool({
 app.use(helmet());
 
 // CORS configuration
-const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'];
+const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || ['http://localhost:3000'];
 app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.indexOf(origin) !== -1) {
+
+    if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      // Return null (block the request) instead of throwing — throwing an Error
+      // propagates to the global error handler and can crash the process.
+      callback(null, false);
     }
   },
   credentials: true
 }));
+
+// Explicitly reject blocked CORS origins with 403 before any route runs
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && !allowedOrigins.includes(origin)) {
+    return res.status(403).json({ error: 'CORS: origin not allowed' });
+  }
+  next();
+});
 
 // Increase body size limit for large reports with screenshots
 app.use(express.json({ limit: '10mb' }));
@@ -704,6 +715,10 @@ app.use((req, res) => {
 // Error handler
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
+  if (res.headersSent) {
+    // Can't send a new response — just let Express close the connection
+    return next(err);
+  }
   res.status(500).json({ error: 'Internal server error' });
 });
 
@@ -735,3 +750,12 @@ async function shutdown(signal) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
+
+// Prevent unhandled promise rejections / uncaught exceptions from killing the process.
+// Log the error so it's visible in pm2 logs, but keep the server alive.
+process.on('unhandledRejection', (reason) => {
+  console.error('[PROCESS] Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[PROCESS] Uncaught exception:', err);
+});
